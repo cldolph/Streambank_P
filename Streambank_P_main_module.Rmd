@@ -1,0 +1,156 @@
+---
+title: "StreambankP_main_module"
+author: "Christy Dolph"
+date: "2025-07-22"
+output: html_document
+---
+
+This script provides a module for comparing estimated streambank P values (either in SSURGO or modeled by our team) to values measured in the field.
+
+How well can we predict streambank P from SSURGO or from other soil attributes?
+
+This script is being built for a few example datasets (i.e., streambank P data from Keith Schilling's group, and a separate streambank P dataset with Anna Baker's data). With the idea of adding in additional data if the first attempt seems useful.
+
+# Workspace Setup
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Clean up workspace 
+rm(list=ls())
+
+
+#Load or install packages if necessary
+
+#list of necessary packages 
+want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp')
+
+need <- want[!(want %in% installed.packages()[,"Package"])]
+if (length(need)) install.packages(need)
+lapply(want, function(i) require(i, character.only=TRUE))
+rm(want, need)
+
+#Create subdirectory shortcuts
+
+dir.root<-getwd()
+
+dir.data<-paste(dir.root, "/Streambank_P_measured_data", sep="")
+
+#Create output folder destinations, if they don't already exist:
+dir.create(file.path(getwd(), "Spatial_data"))
+
+dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
+
+```
+
+## 
+
+# Measured Streambank P data
+
+## Data sources
+
+1.  **Keith Schilling et al dataset for Iowa streams, documented here:** <https://www.jswconline.org/content/77/2/103>.
+
+Note: I made minor modifications to the original data file they sent me on 1/10/2022
+
+-   simplified site IDs (column 'Site') and replicates, which were previously in one column called 'subsample ID'
+
+Notes on methods for this dataset:
+
+Stream bank samples were collected from across the state, from stream orders 1-6 (n=148 total samples) with all 8 Major Land Resource Areas in Iowa. Multiple samples (up to 3) were collected from each streambank if alluvial members could be differentiated, otherwise a single mid-bank sample was collected. No depth measure is given for replicates.
+
+-   for their purposes, they averaged streambank TP values = 470 mg/kg
+
+-   they cite previous work saying differences in TP among alluvial stratigraphic units were not statistically significant (Schilling et al 2009).
+
+-   Total P was determined in [aqua regia]{.underline} digest (note this may be different than methods used in other studies)
+
+    -   Here is a study that addresses aqua regia: <https://acsess.onlinelibrary.wiley.com/doi/10.2134/ael2016.09.0037>
+
+        -   "To estimate total P in soils, strong acid extraction methods that actually measure total recoverable P are generally used, as traditional true total digestion methods such as sodium carbonate fusion, perchlorate digestion, or digestion by hydrofluoric acid possess an array of operational concerns and safety limitations ([Sommers and Nelson, 1972](https://acsess.onlinelibrary.wiley.com/doi/10.2134/ael2016.09.0037#bib9); [Olsen and Sommers, 1982](https://acsess.onlinelibrary.wiley.com/doi/10.2134/ael2016.09.0037#bib5)) and typically extract forms of P that are of limited environmental import ([USEPA, 1994b](https://acsess.onlinelibrary.wiley.com/doi/10.2134/ael2016.09.0037#bib12); [USEPA, 1996](https://acsess.onlinelibrary.wiley.com/doi/10.2134/ael2016.09.0037#bib13)). USEPA method 3050B (hereafter referred to as EPA 3050B, [USEPA, 1996](https://acsess.onlinelibrary.wiley.com/doi/10.2134/ael2016.09.0037#bib13)) and USEPA method 3051 (hereafter referred to as EPA 3051, [USEPA, 1994b](https://acsess.onlinelibrary.wiley.com/doi/10.2134/ael2016.09.0037#bib12)) are two extraction protocols for total recoverable metals that are based on centuries-old extraction protocols by aqua forte (concentrated nitric acid, HNO3) and aqua regia (a combination of concentrated HNO3 and hydrochloric, HCl, acids). These methods are general extraction protocols, outlining many options for amounts of HNO3 used and whether to use HCl at all (due to possible matrix effects, and consideration of higher vapor pressures of HCl). Of the two methods, EPA 3050B includes the optional addition of hydrogen peroxide (H2O2) to aid the decomposition of organic matter."
+
+        -   From internet search: Aqua regia, a mixture of hydrochloric acid (HCl) and nitric acid (HNO₃), is a strong oxidizing agent commonly used for digesting metals and organic matter. It is effective in extracting phosphorus bound to organic matter and some mineral forms, but it may not fully break down more resistant mineral phases such as apatite or other silicate-bound phosphorus.
+
+        -   Total acid dissolution: This method typically involves using a combination of strong acids like hydrofluoric acid (HF), perchloric acid (HClO₄), and/or a more extended treatment with other acids under high temperatures and pressures. This approach can break down all mineral matrices, including those that are more resistant, ensuring the release of all phosphorus present in the sample, including the more refractory forms.
+
+-   They also collected bulk density
+
+-   Among riparian soils, TP concentrations were observed to range from 109 to 1,569 mg kg--1 and average 470 ± 192 mg kg--1 ([**figure 5**](https://www.jswconline.org/content/77/2/103#F5)). Although minor differences were observed among various MLRAs or stream order classifications, the variability was mainly associated with an occasional low or high value not representative of the entire sample population. Bulk density of exposed streambank soils averaged 1.17 ± 0.14 g cm--3.
+
+## Load measured streambank P data
+
+```{r}
+
+#List all data in data directory:
+list.files(dir.data)
+
+#Load in data files (separately or all at once):
+measP<-read_excel(paste(dir.data, "/Schilling_et_al_soil_P_data_MODIFIED_CLD.xlsx",sep=""))
+
+head(measP)
+
+```
+
+### Preprocess data from different sources to have matching format
+
+Main columns needed:
+
+Site ID, replicate ID, lat, long, P_mgkg, bulk density
+
+Question about other potential measured attributes - these could be useful later, but may not be consistently measured across datasets
+
+```{r}
+
+#Select and rename needed columns
+
+names(measP)
+
+measP.clean<-measP %>% 
+  dplyr::select('Site','replicates', 'X', 'Y', 'P (mg/kg)', 'BD (g/cm^3)') %>% 
+  rename(Lat=Y, Long=X, P_mgkg= 'P (mg/kg)', BD_gcm3='BD (g/cm^3)') %>% 
+    mutate(dataset="Schilling_IA") %>% 
+  na.omit()#drop samples with no coordinates
+
+nrow(measP.clean)
+```
+
+Get area of interest and plot a quick map of streambank P data
+
+```{r}
+names(measP.clean)
+
+#Convert streambank P locations to spatial object:
+measP_sf<-st_as_sf(measP.clean, coords=c("Long","Lat"), crs=4269)
+
+
+#For area of interest, select states that overlap with measured P data
+#read in USA state boundaries using tigris package
+states<-states()
+states_sf <- st_as_sf(states) #convert to sf object
+st_bbox(states_sf) #bounding box
+states_sf
+
+st_crs(states_sf) #check reference system
+
+
+#ID states that intersect with measured data
+
+States_sub <- states_sf[measP_sf, ]
+
+#Quick plot of states
+plot(States_sub$geometry, col=alpha("blue",0.3))
+  
+
+
+#Quick plot of streambank P locations and states
+library(grDevices)
+
+tm_mode("view")
+
+tm_shape(States_sub)+
+  tm_borders()+
+tm_shape(measP_sf)+
+  tm_symbols(fill="P_mgkg", size=0.5, fill.scale=tm_scale(values = rev(hcl.colors(4, "SunsetDark"))))
+
+```
