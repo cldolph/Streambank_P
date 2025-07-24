@@ -1,0 +1,2421 @@
+---
+title: "Assigning spatial attributes to sample locations"
+author: "Christy Dolph"
+date: "2024-07-17"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Overview: Generating spatial attributes for sites of interest 
+
+This script generates spatial attributes associated with specific point locations.
+
+Attributes are from the following sources:
+
+-    the NHDPlusv2 stream network (NHD)
+
+-   the National Wetlands Inventory (NWI),
+
+-   National Land Cover Dataset (NLCD)
+
+-   SSURGO soils data
+
+-   EPA StreamCat
+
+This approach is updated and adapted from the scripts available at: <https://github.com/cldolph/SoilP>
+
+## Steps:
+
+1.  Merge locations to NHD, NLCD, and NWI attributes + SSURGO map unit key (mukey)
+2.  Compile and process SSURGO attributes and merge
+3.  Compile and process StreamCat attributes and merge
+
+# National Hydrography Dataset
+
+## Merge locations to NHD attributes
+
+Use nhdplusTools package to link sample locations to NHD COMID (unique identifier for each stream reach of the NHD)
+
+The COMID can then be used to link the location to NHD attributes (stream type, stream order, etc) as well as EPA StreamCat attributes.
+
+Note that 'featureid' of an NHD Catchment is equal to COMID of an NHD flowline; see p. 47 of the NHDPlusV2 User Guide:
+
+[https://www.epa.gov/system/files/documents/2023-04/NHDPlusV2_User_Guide.pdf](https://www.epa.gov/system/files/documents/2023-04/NHDPlusV2_User_Guide.pdf,)
+
+### Download flowlines for NHD stream network
+
+Note: it might be faster to save this to a temp file - need to figure out how to do that
+
+```{r}
+
+#Get NHD data for HUC4s of interest via web service, using nhdplusTools:
+
+NHD_HUC4<-get_nhdplus(
+  AOI = HUC4_AOI)
+
+names(NHD_HUC4)
+
+st_crs(NHD_HUC4) #check reference system
+
+#plot NHD flowlines (note this can take several minutes)
+#tm_shape(NHD_HUC4)+
+ # tm_lines()
+
+View(head(NHD_HUC4))
+
+```
+
+### Identify NHD COMIDs associated with sample locations
+
+```{r}
+
+#first transform pour point and flowlines to same projection:
+#continental US (Conus Albers NAD83)
+
+loc_trans <- st_transform(loc_sf, 5070)
+NHD_trans<-st_transform(NHD_HUC4, 5070)
+
+Sys.time()
+loc_snap <- st_snap(loc_trans, NHD_trans, tolerance = 100)
+Sys.time() #4 min for IA sites
+
+#Quick plot check
+plot(loc_snap$geometry)
+
+
+#The function discover_nhdplus_id() can pull comids for single point locations; to get comids for all points you must loop this function over every point
+
+# Initialize a vector to store COMIDs
+comids <- numeric(nrow(loc_snap))
+
+# Loop over each row (point)
+for (i in seq_len(nrow(loc_snap))) {
+  # Extract a single-point sf object
+  single_point <- loc_snap[i, ]
+  
+  # Try running discover_nhdplus_id()
+  # Use tryCatch to prevent errors from stopping the loop
+  comids[i] <- tryCatch({
+    discover_nhdplus_id(single_point)
+  }, error = function(e) {
+    NA  # return NA if there's an error
+  })
+}
+
+# Add the COMIDs back to the sf object
+loc_snap$comid <- comids
+
+#View(loc_snap)
+
+```
+
+### Pull NHD attributes for sampled locations, based on COMID
+
+see NHDv2Plus User Guide: <https://nhdplus.com/NHDPlus/NHDPlusV2_documentation.php>
+
+'totdasqkm' = Total Upstream Cumulative Drainage Area, in square kilometers, at the downstream end of the NHDFlowline feature
+
+```{r}
+nrow(loc_snap)
+
+loc_NHD<-merge(loc_snap, NHD_HUC4 %>% dplyr::select(comid, gnis_name, lengthkm, ftype, fcode, streamleve, streamorde, totdasqkm) %>% st_drop_geometry(), by=c("comid"))
+
+nrow(loc_NHD)
+View(loc_NHD)
+```
+
+# National Wetlands Inventory data
+
+See access to NWI data at: <https://www.fws.gov/program/national-wetlands-inventory/data-download>
+
+Download data by state: <https://www.fws.gov/program/national-wetlands-inventory/download-state-wetlands-data>
+
+```{r}
+
+#Here is the direct link to a shapefiles for states of interest
+
+
+#rewrite to apply to each state in a list
+#does it make sense to create a temporary file?
+
+download.file("https://documentst.ecosphere.fws.gov/wetlands/data/State-Downloads/MS_shapefile_wetlands.zip", destfile = "./spatial_data/MS_shapefile_wetlands.zip")
+
+download.file("https://documentst.ecosphere.fws.gov/wetlands/data/State-Downloads/AR_shapefile_wetlands.zip", destfile = "./spatial_data/AR_shapefile_wetlands.zip")
+
+# List all files in the directory
+all_files <- list.files("./spatial_data", full.names = TRUE)
+all_files
+
+# get all the wetland zip files
+zip_wetlands <- all_files[grepl("wetlands", all_files) & grepl("\\.zip$", all_files)]
+zip_wetlands
+
+# unzip wetland files
+ldply(.data = zip_wetlands, .fun = unzip, exdir = "./spatial_data")
+
+# Search unzipped directories to find wetlands shapefiles of each state:
+
+wetland_files <- dir("./spatial_data", recursive=TRUE, full.names=TRUE, pattern="*Wetlands.shp$")
+wetland_files
+
+#Read in all wetlands shapefiles:
+wetlands_list <- lapply(wetland_files, st_read)
+#Note crs is NAD1983 Albers
+
+#Need to project to same reference system as spatial extent
+#(You could make this more efficient by making a function and applying it to all elements in the list)
+
+#Note: You ended up with problems when you tried to project the wetlands layer into NAD83 and clip with the study area (clip encountered an error, tmap encountered an error about incomplete polygons)
+
+#Project study area in NAD83 Albers to match wetland data:
+HUC4_projAlbers<-st_transform(HUC4_contig, crs=st_crs(wetlands_list[[1]]))
+st_crs(HUC4_projAlbers)
+
+
+#Clip wetlands to area of interest:
+#Clipping before merging the two state files to speed things up
+
+#here's a function, if you don't want to clip each wetlands layer individually:
+clip.fun<-function(x){st_intersection(x, HUC4_projAlbers)}
+
+
+#Clip wetlands for AR:
+clipped_wetlands1 <- st_intersection(wetlands_list[[1]], HUC4_projAlbers)
+names(clipped_wetlands1)
+#Note: this clip appeared to work, first projecting HUC4 into Albers. It did take a long time (an hour?). Measuring time for the second clip. 
+
+#Clip wetlands for MS:
+start.time <- Sys.time() #measure time for clip
+clipped_wetlands2 <- st_intersection(wetlands_list[[2]], HUC4_projAlbers)
+end.time <- Sys.time()
+time.taken <- round(end.time - start.time,2)
+time.taken #Took 1 hour to clip! 
+
+names(clipped_wetlands2)
+head(clipped_wetlands2)
+
+#Combine all wetlands files into a single sf object
+#keep only necessary columns
+#note some name discrepancies across the two files for shape area and shape length
+
+start.time <- Sys.time() #measure time merging wetland files
+
+wetlandsHUC4 <- rbind(clipped_wetlands1 %>% select(c("ATTRIBUTE", "WETLAND_TY", "ACRES")), clipped_wetlands2 %>% select(c("ATTRIBUTE", "WETLAND_TY", "ACRES")))
+
+end.time <- Sys.time()
+time.taken <- round(end.time - start.time,2)
+time.taken #Very fast, 29 seconds 
+
+#Write to file:
+st_write(wetlandsHUC4, "./spatial_data/NWI_wetlandsHUC4.shp")
+
+#read in previous version of soil sample locations, if needed:
+loc_COMID<-st_read("./spatial_data/loc_NHD_COMID.shp")
+
+#Project locations into NAD83 Albers to match wetlands layer:
+st_crs(wetlandsHUC4)
+loc_COMID_projAlbers<-st_transform(loc_COMID, crs=st_crs(wetlandsHUC4))
+
+#Plot map of clipped wetlands:
+tm_shape(wetlandsHUC4)+
+  tm_polygons()+
+  tm_shape(HUC4_projAlbers)+
+  tm_borders(col="blue")+
+  tm_shape(loc_COMID_projAlbers)+
+  tm_dots(col="red")
+
+```
+
+Join NWI attributes to soil sample locations:
+
+```{r}
+
+
+#Join wetland attributes to soil sampl locations:
+loc_NWI <- st_join(loc_COMID_projAlbers, wetlandsHUC4, join = st_intersects)
+
+#View(loc_NWI)
+
+#write intermediate sf object to file, to save all NWI info:
+st_write(loc_NWI, "./spatial_data/loc_NHD_COMID_NWI.shp")
+
+
+```
+
+# National Land Cover Database
+
+Load in NLCD data:
+
+```{r}
+
+
+#Need to check format of NLCD data used in soil P script?
+#-->OK, you used text attributes
+#my notes say: extract values to points from merged nlcd06 raster
+
+#Read in study area (if needed):
+HUC4_contig<-st_read('./spatial_data/HUC4_contig.shp')
+
+#Read in 
+
+# Download the NLCD data for the specified AOI
+#Note you are using 2019 NLCD data here:
+nlcd_data <- get_nlcd(template = HUC4_contig, label = "NLCD_HUC4", year = 2019, dataset = "landcover")
+head(nlcd_data)
+
+#Note that nlcd_data is a SpatRaster project (needs the 'terra' package)
+class(nlcd_data)
+
+#check reference system
+st_crs(nlcd_data)
+
+#tmap_mode("view")
+
+#tm_shape(nlcd_data)+
+  tm_raster(col="Class")+
+  tm_shape(HUC4_contig)+
+  tm_borders(col="blue")+
+  tm_shape(loc_COMID)+
+  tm_dots(col="black")
+
+```
+
+```{r}
+#Project to NAD83 Albers:
+
+#Read in clipped wetlands layer, to get projection
+wetlandsHUC4<-st_read("./spatial_data/NWI_wetlandsHUC4.shp")
+crs(wetlandsHUC4)
+
+target_crs<-crs(wetlandsHUC4)
+
+#Do I need projectRaster??
+nlcd_projAlbers <- project(nlcd_data, target_crs)
+
+#write intermediate nlcd to file:
+
+
+# Extract the raster value at the point location
+loc_NLCD <- extract(nlcd_projAlbers, loc_NWI)
+
+View(loc_NLCD)
+
+#Bind NLCD attributes to other attributes:
+loc_NHD_NWI_NLCD<-cbind(loc_NWI, loc_NLCD)
+
+#Make simpler file name:
+loc_3<-loc_NHD_NWI_NLCD
+
+#Rename NLCD attribute
+loc_3<-loc_3 %>% 
+  rename(NLCDCat=Class)
+
+#Save intermediate attribute file: 
+st_write(loc_3, "./spatial_data/loc_3.shp", append=FALSE)
+
+#Read in table as needed: 
+loc_3<-st_read("./spatial_data/loc_3.shp")
+
+#Look at attribute table containing NHD, NWI and NLCD attributes:
+View(loc_3)
+```
+
+# SSURGO dataset
+
+Need to identify map unit key ('mukey') for each soil sample location. Will need ssurgo raster data for Mississippi and Arkansas.
+
+Download and unzip state gSSURGO files from <https://www.nrcs.usda.gov/resources/data-and-reports/gridded-soil-survey-geographic-gssurgo-database>
+
+see: "State Databases - soils - powered by Box"
+
+States needed: MS, AR
+
+Put unzipped geodatabase folders in "spatial_data" folder
+
+*Still working on an efficient reproducible way to get gSSURGO data directly into R.*
+
+*Here is a work in progress of approaches I've tried, to get gSSURGO data directly into R - but note - for now you still need to manually download the geodatabases for the script to work.*
+
+From box site hosting ssurgo data, tried to load directly via R:
+
+Click on link for zipped state folder needed. Then, from Chrome:
+
+Developer Tools \> Network \> copy link for 'download'
+
+Notes to self: useful resources for figuring out how to click the download button:
+
+#This might be useful:
+
+\#<https://stackoverflow.com/questions/75769659/how-to-click-a-download-button-with-r>
+
+#Also useful:
+
+\#<https://stackoverflow.com/questions/64612341/imitate-click-on-download-button-from-r>
+
+```{r}
+
+#Download Mississippi & Arkansas gSSURGO data: 
+
+#Note: need to make this step reproducible! For now, downloading by manually clicking 'Download' from the gSSURGO website, and extracting to 'spatial_data' folder 
+
+
+#After downloading, read in shapefile of SSURGO map units:
+
+AR_mu <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "MUPOLYGON")
+MS_mu<-sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "MUPOLYGON")
+
+
+#Combine all map unit maps into a single map:
+start.time <- Sys.time() #measure time for merging
+
+MU.map <- rbind(AR_mu, MS_mu)
+
+end.time <- Sys.time()
+time.taken <- round(end.time - start.time,2)
+time.taken #Very fast, 17 seconds 
+
+head(MU.map)
+
+#Load in soil sample locations (if not already loaded)
+#Read in table as needed: 
+loc_3<-st_read("./spatial_data/loc_3.shp")
+
+#Note slightly different CRS
+#Get CRS to match exactly
+
+loc_3_NAD83ConusAlbers<-st_transform(loc_3, crs=st_crs(MS_mu))
+crs(loc_3_NAD83ConusAlbers)
+
+#Join gSSURO mapunit attributes to soil sampl locations:
+loc_ssurgo <- st_join(loc_3_NAD83ConusAlbers, MU.map %>% dplyr::select(MUKEY, MUSYM), join = st_intersects)
+
+nrow(loc_ssurgo)
+
+View(loc_ssurgo)
+
+#Write data with all attribute keys to file:
+st_write(loc_ssurgo, "./spatial_data/loc4_NHD_NWI_NLCD_gSSURGO_MsAr.shp", append=FALSE)
+
+#Just pull out attributes:
+loc_ssurgo_data<-st_drop_geometry(loc_ssurgo)
+head(loc_ssurgo_data)
+write.csv(loc_ssurgo_data, "MSDelta_ssurgo_mapunit.csv", sep=",", row.names=FALSE)
+
+#read in Mukey data:
+loc_ssurgo<-st_read("./spatial_data/loc4_NHD_NWI_NLCD_gSSURGO_MsAr.shp")
+
+head(loc_ssurgo)
+```
+
+If you want to look in more detail at soil series, NRCS has a query table by state where you can look at map unit soil series definitions:
+
+<https://www.nrcs.usda.gov/publications/query-by-state.html>
+
+### Compare to Map Units from UMRB soil P dataset:
+
+```{r}
+MS_map<-sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "mapunit")
+names(MS_map)
+
+#Load in map unit info for all states:
+setwd("./spatial_data")
+AR <- sf::st_read(dsn = "./gSSURGO_AR.gdb", layer = "mapunit")
+IA <- sf::st_read(dsn = "./gSSURGO_IA.gdb", layer = "mapunit")
+IL <- sf::st_read(dsn = "./gSSURGO_IL.gdb", layer = "mapunit")
+IN <- sf::st_read(dsn = "./gSSURGO_IN.gdb", layer = "mapunit")
+KS <- sf::st_read(dsn = "./gSSURGO_KS.gdb", layer = "mapunit")
+MN <- sf::st_read(dsn = "./gSSURGO_MN.gdb", layer = "mapunit")
+MO <- sf::st_read(dsn = "./gSSURGO_MO.gdb", layer = "mapunit")
+ND <- sf::st_read(dsn = "./gSSURGO_ND.gdb", layer = "mapunit")
+NE <- sf::st_read(dsn = "./gSSURGO_NE.gdb", layer = "mapunit")
+OH <- sf::st_read(dsn = "./gSSURGO_OH.gdb", layer = "mapunit")
+SD <- sf::st_read(dsn = "./gSSURGO_SD.gdb", layer = "mapunit")
+WI <- sf::st_read(dsn = "./gSSURGO_WI.gdb", layer = "mapunit")
+
+#Append all tables using rbind
+Mapunit<-rbind(AR, IA, IL, IN, KS, MN, MO, ND, NE, OH, SD, WI)
+head(Mapunit)
+nrow(Mapunit)
+nrow(distinct(Mapunit))
+
+#Write mapunit IDs to table
+write.csv(Mapunit, "./gSSURGO_MapUnit_info_CEAP_study_region.csv", row.names=FALSE)
+```
+
+# Load Soil Samples with all attribute keys attached:
+
+```{r}
+soil_loc<-st_read("./spatial_data/loc4_NHD_NWI_NLCD_gSSURGO_MsAr.shp")
+class(soil_loc)
+
+plot(soil_loc)
+
+
+```
+
+Extract just the data frame of attributes for further manipulation:
+
+```{r}
+P.att <- soil_loc %>%
+  mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>% 
+  data.frame() 
+
+#Drop unneeded columns
+drops <- c("MUKEY","ACRES")
+P.att2<-P.att[ , !(names(P.att) %in% drops)]
+
+View(P.att2)
+
+#write to file:
+write.csv(P.att, "./Attributes_for_soilP_model.csv", row.names=FALSE)
+```
+
+# Get StreamCat Attributes
+
+NOTE, 2.5.25: this is now defunct, as FTP servers for StreamCat have been retired
+
+Download StreamCat attributes for states of interest (MS and AR):
+
+```{r}
+#Download StreamCat tables for states of interest (MS and AR) from the web
+#Note that this will download more attributes than you need for soil P model, but can subset them later using soil P model attribute list
+
+# URL of the webpage
+url <- "https://gaftp.epa.gov/epadatacommons/ORD/NHDPlusLandscapeAttributes/StreamCat/States/"
+
+# Read the webpage content
+webpage <- read_html(url)
+
+# Extract all links from the webpage
+links <- webpage %>% html_nodes("a") %>% html_attr("href")
+
+# Filter links that contain "MS"
+ms_links <- links[grep("MS.zip|AR.zip", links)]
+
+# Base URL for downloading files
+base_url <- "https://gaftp.epa.gov/epadatacommons/ORD/NHDPlusLandscapeAttributes/StreamCat/States/"
+
+# Directory to save the downloaded files
+download_dir <- "StreamCat"
+if (!dir.exists(download_dir)) {
+  dir.create(download_dir)
+}
+
+# Download each file
+for (link in ms_links) {
+  file_url <- paste0(base_url, link)
+  file_name <- paste0(download_dir, "/", basename(link))
+  GET(file_url, write_disk(file_name, overwrite = TRUE))
+  cat("Downloaded:", file_name, "\n")
+}
+
+cat("All files downloaded.\n")
+
+
+```
+
+Unzip StreamCat files:
+
+```{r}
+
+# Directory where the zip files are located
+zip_dir <- "./StreamCat"
+
+# Get list of all zip files in the directory
+zip_files <- list.files(zip_dir, pattern = "\\.zip$", full.names = TRUE)
+
+
+# Unzip files
+for (zip_file in zip_files) {
+    # Define the directory where the unzipped files will be saved
+    unzip_dir <- file_path_sans_ext(zip_file)
+    if (!dir.exists(unzip_dir)) {
+      dir.create(unzip_dir)
+    }
+    
+    # Unzip the file
+    unzip(zip_file, exdir = unzip_dir)
+    cat("Unzipped:", zip_file, "\n")
+}
+
+cat("All matching files have been unzipped.\n")
+```
+
+Remove zipped StreamCat files to save space:
+
+```{r}
+#Remove zipped files to save space
+
+# Directory where the zip files are located
+zip_dir <- "StreamCat"
+
+# Get list of all zip files in the directory
+zip_files <- list.files(zip_dir, pattern = "\\.zip$", full.names = TRUE)
+
+# Remove each zip file
+for (zip_file in zip_files) {
+  file.remove(zip_file)
+  cat("Removed:", zip_file, "\n")
+}
+
+cat("All zip files have been removed.\n")
+```
+
+Read in StreamCat csv files and merge into one file:
+
+```{r}
+#Read in StreamCat files
+#Have to read in separately by each state at first 
+
+
+# Directory where the CSV files are located
+base_dir <- "./StreamCat"
+
+# Partial strings to match in filenames
+partial_string_1 <- "MS.csv"
+partial_string_2 <- "AR.csv"
+
+# Function to list all CSV files in subdirectories
+list_csv_files <- function(base_dir) {
+  list.files(path = base_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+}
+
+# Function to read and process each CSV file
+read_and_process_csv <- function(file) {
+  read_csv(file, show_col_types = FALSE) %>%
+    mutate(source = basename(file))
+}
+
+# Get list of all CSV files in the base directory and its subdirectories
+csv_files <- list_csv_files(base_dir)
+
+# Separate CSV files into two lists based on partial string matches
+csv_files_1 <- csv_files[grepl(partial_string_1, csv_files)]
+csv_files_2 <- csv_files[grepl(partial_string_2, csv_files)]
+
+# Read and process each list of CSV files
+list_of_dataframes_1 <- map(csv_files_1, read_and_process_csv)
+list_of_dataframes_2 <- map(csv_files_2, read_and_process_csv)
+
+(list_of_dataframes_1)
+
+#Exclude redundant/unneeded columns (will add WsArea and CatArea back in later)
+area.att<-c('CatAreaSqKm', 'WsAreaSqKm', 'CatPctFull', 'WsPctFull', 'CatAreaSqKmRp100', 'WsAreaSqKmRp100','CatPctFullRp100','WsPctFullRp100','source', 'CatAreaSqKmSlp20', 'WsAreaSqKmSlp20',"CatPctFullSlp20","WsPctFullSlp20","CatAreaSqKmSlp10","WsAreaSqKmSlp10","CatPctFullSlp10","WsPctFullSlp10")
+
+list_of_data_frames_1b<-lapply(list_of_dataframes_1, function(x) x[!(names(x) %in% area.att)])
+
+list_of_data_frames_2b<-lapply(list_of_dataframes_2, function(x) x[!(names(x) %in% area.att)])
+
+#First merge all dataframes for each state, by COMID
+merged_data1 <- reduce(list_of_data_frames_1b, full_join, by =('COMID'))
+
+merged_data2 <- reduce(list_of_data_frames_2b, full_join, by =('COMID'))
+
+#Pull out area attributes for each state:
+Area1<-as.data.frame(list_of_dataframes_1[1]) %>% dplyr::select(c('COMID', 'CatAreaSqKm', 'WsAreaSqKm'))
+Area2<-as.data.frame(list_of_dataframes_2[1]) %>% dplyr::select(c('COMID', 'CatAreaSqKm', 'WsAreaSqKm'))
+
+#Add area attributes back in:
+merged_data1.area<-merge(merged_data1, Area1, by=c("COMID"))
+merged_data2.area<-merge(merged_data_2, Area2, by=c("COMID"))
+
+
+#Remove redundant columns (occuring in more than one StreamCat table)
+#remove attributes that contain ".y" or multiple ".x"
+#remove ".x" from any column names
+
+merged_data_1simp<-merged_data1.area %>% 
+  dplyr::select(!contains(c(".y",".x.x")))
+colnames(merged_data_1simp) <- gsub("\\.x$", "", colnames(merged_data_1simp))
+
+merged_data_2simp<-merged_data2.area %>% 
+ dplyr::select(!contains(c(".y",".x.x")))
+colnames(merged_data_2simp) <- gsub("\\.x$", "", colnames(merged_data_2simp))
+
+
+#Merge all StreamCat attributes from all states:
+streamcat.all<-rbind(merged_data_1simp, merged_data_2simp)
+nrow(streamcat.all)
+
+# Optional: Save the merged streamcat data to a new CSV file
+write_csv(streamcat.all, "./StreamCat/StreamCat_merged_data.csv")
+
+#Option to remove all unzipped StreamCat files to save space:
+# Directory where the subdirectories are located
+base_dir <- "./StreamCat"
+
+# Define the partial strings to match
+patterns_to_remove <- c("MS", "AR")
+
+# Function to list all subdirectories
+list_subdirs <- function(base_dir) {
+  dir_ls(base_dir, type = "directory", recurse = TRUE)
+}
+
+# Get list of all subdirectories in the base directory
+subdirs <- list_subdirs(base_dir)
+
+# Identify subdirectories to remove based on partial string matches
+subdirs_to_remove <- subdirs[grepl(paste(patterns_to_remove, collapse = "|"), subdirs)]
+
+# Remove the identified subdirectories
+for (subdir in subdirs_to_remove) {
+  dir_delete(subdir)
+  cat("Removed:", subdir, "\n")
+}
+
+```
+
+# Use Attribute Keys to Add and Process Geospatial Attributes
+
+Now that attribute keys for NHD, NWI, NLCD, gSSURGO and StreamCat have been added, you can follow the modules from Dolph et al 2023 to do additional processing of attributes necessary for running the soil P model. This entails following modules 2 and 4 from the github repository: <https://github.com/cldolph/SoilP/>
+
+### Module 2: Preprocess SSURGO attributes
+
+```{r}
+#Module for pre-processing SSURGO attributes for use as covariates in the random forest model
+
+#Updated 7/23/2024
+
+#Read in ArcGIS dbf attribute tables 
+
+#Download and unzip state gSSURGO files from https://nrcs.app.box.com/v/soils/folder/148414960239
+#to the project directory 'gSSURGO'
+#states needed: AR, IA, IL, IN, KS, MN, MO, ND, NE, OH, SD, WI
+
+#load relevant tables from state geodatabases:
+
+#can ignore warnings about simple feature geometries not being present
+options(warn=-1)
+
+#Set directory for ssurgo data
+ssurgo_dir<-"./spatial_data"
+
+#'Component' Table
+
+AR <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "component")
+MS<-sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "component")
+
+#Append all tables using rbind
+Component<-rbind(AR, MS)
+nrow(Component)
+head(Component)
+
+#look for example mukey
+Component %>% filter(mukey=="MS083")
+
+
+#check if cokeys are unique
+length(Component$cokey)
+length(unique(Component$cokey))
+#Ok same length - so are unique
+
+#'Chorizon' Table
+AR2 <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "chorizon")
+MS2 <- sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "chorizon")
+
+#Append all tables using rbind
+Chorizon<-rbind(AR2, MS2)
+nrow(Chorizon)
+head(Chorizon)
+names(Chorizon)
+
+#check for unique cokey
+length(Chorizon$cokey)
+length(unique(Chorizon$cokey))
+
+#Chorizon does not have unique cokey; 
+#Note multiple subcomponents within component layer for Chorizon are multiple soil horizons (at different depths)
+#you can select by hzname, and/or by horizon depth (hzdept_r - top depth and hzdepb-r - bottom depth)
+#from gSSURGO Table Column report: hzdepb_r - the distance from the top of the soil to the base of the soil horizon
+#note: table report notes depth units as cm
+
+#you need one set of attributes per map unit (mukey), where the attributes are weighted averages
+#of the components; so can't have multiple attributes at different depths per cokey
+#especially since the depths sampled in different cokeys aren't uniform 
+
+#pick all hzdepthb_r < 31 (ie, in plowable layer) 
+#corresponding to <12 inches or < 30.48 cm
+#assumption here is that gSSURGO attributes for P samples that are collected below the surface layer
+#will closely mirror those at the top layer
+#this is borne out when you examine the soil texture for multiple depths within a component (a cokey);
+#texture attributes are typically similar across multiple depths
+
+Chorizon[1:5, c(1,7, 10, 170, 171)]
+
+Chorizon.surface<-Chorizon %>% 
+  filter(hzdepb_r<31)#restrict to plowable layer
+
+#does this still leave you with duplicates per site?
+#(ie, multiple depths above 30cm)
+length(Chorizon.surface$cokey)
+length(unique(Chorizon.surface$cokey))
+
+#are still multiple measures per site; multiple depths
+
+#eliminate samples from the very shallow surface that are likely to be plant material
+nrow(Chorizon.surface)
+Chorizon.soil<-Chorizon.surface %>% 
+  filter(hzdepb_r>3)
+
+#choose lowermost surface layer, to avoid component attributes that include plant material at the surface rather than soil
+# convert to data.table with key=cokey
+Chorizon.table <- data.table(Chorizon.soil, key="cokey")
+
+#get the subset of data that matches this criterion
+Chorizon.bottom<-unique(Chorizon.table[, .SD[hzdepb_r %in% max(hzdepb_r)], by=cokey])
+head(Chorizon.bottom)
+
+#check out depths at which samples are collected
+summary(Chorizon.bottom$hzdepb_r)
+names(Chorizon.bottom)
+#View(Chorizon.bottom[, c(1,8, 11, 171)])
+
+
+#check for duplicates
+length(Chorizon.bottom$cokey)
+length(unique(Chorizon.bottom$cokey))
+###
+#OK! Now only one record per cokey (the lowermost surface measurement in the top 30cm)
+###
+
+
+#'Chtexture' Table (grain size)
+#Can be merged to Chorizon, with Chtexturegrp
+AR5 <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "chtexture")
+MS5 <- sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "chtexture")
+
+#Append all tables using rbind
+Chtexture<-rbind(AR5, MS5)
+nrow(Chtexture)
+head(Chtexture)
+names(Chtexture)
+
+#check for unique subunits
+length(Chtexture$chtkey)
+length(unique(Chtexture$chtkey))
+#Chtkey is unique
+
+#'Chtexturegrp' Table (links chtexture to chorizon table)
+#Can be merged to Chorizon, with Chtexturegrp
+AR6 <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "chtexturegrp")
+MS6 <- sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "chtexturegrp")
+
+#Append all tables using rbind
+Chtexturegrp<-rbind(AR6, MS6)
+nrow(Chtexturegrp)
+head(Chtexturegrp)
+names(Chtexturegrp)
+
+Texture<-merge(Chtexture, Chtexturegrp, by=c('chtgkey'))
+nrow(Texture)
+
+#check for duplicates at highest level of organization (chkey)
+#-->yes, are multiple chkeys; chtkeys appear unique
+#can be different textures per horizon
+#what are the different subcomponents - see https://sdmdataaccess.nrcs.usda.gov/documents/ReturningSoilTextureRelatedAttributes.pdf
+
+#there is a column 'rvindicator' in chtexturegrp - from Table Column Descriptions:
+#'A yes/no field that indicates if a value is representative for the component'
+#so select rvindicator = Yes - leaves you with unique value
+#this is the 'representative' component
+
+#Join to Texture to Chorizon, uisng chkey
+names(Chorizon.bottom)
+Horizon<-merge(Chorizon.bottom, Texture[Texture$rvindicator=="Yes",], by=c('chkey'))
+head(Horizon)
+nrow(Horizon)
+
+#do I have duplicate measurements in Chtexture or Chtexturegrp?? (ie, subcomponets?)
+length(Horizon$cokey)
+length(unique(Horizon$cokey))
+#still have duplicates
+#with rvindicator=Yes for Texture, leaves 113 duplicate cokeys for merged Horizon table
+
+#find duplicate rows
+names(Horizon)
+
+#View(Horizon[duplicated(Horizon$chkey)|duplicated(Horizon$chkey, fromLast=TRUE),c(1,2,3,9,12,172,173,175,176,179)])
+
+#Duplicates have same texdesc
+#duplicates have same cokey and chkey and chtgkey, different chtkey
+#slight differences in the different texcl per chtkey, e.g., Loam vs Silt loam
+
+#Reduce to one record per depth component - 
+#Pick first record for each component
+#since all are listed as 'representative'; have to pick one 
+Horizon2 <- Horizon[!duplicated(Horizon$chkey),]
+nrow(Horizon)
+nrow(Horizon2)
+length(Horizon2$cokey)
+length(unique(Horizon2$cokey))
+#Ok now are unique
+
+#'Copm' Table (Soil Parent Origin)
+AR3 <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "copm")
+MS3 <- sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "copm")
+
+#Append all tables using rbind
+Copm<-rbind(AR3, MS3)
+nrow(Copm)
+head(Copm)
+names(Copm)
+
+
+
+#'Copmgrp Table' (Needed to link Copm - parent material - table to component)
+AR4 <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "copmgrp")
+MS4 <- sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "copmgrp")
+
+#turn warnings back on, now that all attribute tables are loaded
+options(warn=0)
+
+#Append all tables using rbind
+Copmgrp<-rbind(AR4, MS4)
+nrow(Copmgrp)
+head(Copmgrp)
+names(Copmgrp)
+
+#Aggregate parent material from the start 
+#(unless there are additional subcomponents within components??)
+
+Parent<-merge(Copm, Copmgrp, by=c('copmgrpkey'))
+head(Parent)
+nrow(Parent)
+#same number of rows as Copm; so was a 1:1 join
+#check for duplicate cokeys
+length(Parent$cokey)
+length(unique(Parent$cokey))
+#yes are duplicates, not 1:1 with cokey
+#As for Texture, select rvindicator=Yes to avoid duplicates
+names(Parent)
+Parent2<-Parent[Parent$rvindicator=="Yes",]
+#now check for duplicate cokeys
+length(Parent2$cokey)
+length(unique(Parent2$cokey))
+#still have duplicates -
+#find duplicates:
+head(Parent2)
+nrow(Parent2[duplicated(Parent2$cokey)|duplicated(Parent2$cokey, fromLast=TRUE),])
+duplicates.Parent<-Parent2[duplicated(Parent2$cokey)|duplicated(Parent2$cokey, fromLast=TRUE),]
+duplicates.Parent[1:20,]
+#many duplicates: 200,000+
+#out of ~430,000 rows
+#pmorder - the sequence in which the parent material occurs, when more than one parent material exists for one soil profile
+#Note: will select pmorder ==1; assume this is the material closes to the surface in the soil profile
+#Note that when there is only one parent material, no entry is required for pmorder, so also allow NA
+
+Parent3<-Parent2[Parent2$pmorder=="1"|is.na(Parent2$pmorder),]
+nrow(Parent3)
+
+#now check for duplicate cokeys
+length(Parent3$cokey)
+length(unique(Parent3$cokey))
+#still a smaller number of duplicates - ~2000
+duplicates.Parent3<-Parent3[duplicated(Parent3$cokey)|duplicated(Parent3$cokey, fromLast=TRUE),]
+#View(duplicates.Parent3[1:20,])
+#are multiple pmkind in the same order
+#pmgroupname seems to specify all possible combinations for each component
+levels(factor(Parent3$pmgroupname)) #over 5000 levels
+#Pick one pmkind for each horizon - 
+#since they are all 'representative'
+#this isn't perfect, but subsets 1 type to each horizon
+Parent4 <- Parent3[!duplicated(Parent3$cokey),]
+nrow(Parent3)
+nrow(Parent4)
+length(Parent4$cokey)
+length(unique(Parent4$cokey))
+#Now there are no duplicates for cokey
+
+#'Valu1' Table:
+
+AR_valu <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "Valu1")
+MS_valu <- sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "Valu1")
+
+head(AR_valu)
+
+valu1<-rbind(MS_valu, AR_valu)
+head(valu1)
+valu1$MUTKEY<-valu1$mukey
+
+#COMPLETE LIST OF SSURGO TABLES NEEDED:
+names(Component) #component unit (cokey)
+names(Horizon2) #component unit (cokey)
+names(Parent4) #component unit (cokey)
+names(valu1) #map unit (mukey)
+
+##
+##Subset to desired ssurgo attributes - ie, those likely to be related to P content (as per Records et al 2016)
+
+#Subset Component
+names(Component)
+Component.list<-c('comppct_r', 'slope_r', 'slopelenusle_r','runoff',
+                  'erocl', 'hydricon', 'hydricrating', 'drainagecl', 'elev_r', 'geomdesc',
+                  'airtempa_r', 'reannualprecip_r', 'ffd_r', 'taxceactcl', 'taxreaction', 'taxpartsize',
+                  'mukey', 'cokey')
+Component.sub<-Component[,names(Component) %in% Component.list]
+head(Component.sub)
+names(Component.sub)
+
+#Subset Horizon2
+names(Horizon2)
+Horizon.list<-c('cokey', 'hzdept_r', 'hzdepb_r','sieveno4_r','sieveno10_r','sieveno40_r','sieveno200_r',
+                'sandtotal_r','silttotal_r','claytotal_r','claysizedcarb_r','om_r','ksat_r',
+                'kffact','caco3_r','gypsum_r', 'freeiron_r','feoxalate_r','extral_r','aloxalate_r','pbray1_r', 'poxalate_r', 
+                'partdensity', 'ph2osoluble_r', 'ptotal_r', 'texcl','texture', 'texdesc')
+
+Horizon2<-as.data.frame(Horizon2)
+Horizon.sub<-Horizon2[ , names(Horizon2) %in% Horizon.list] 
+names(Horizon.sub)
+#View(Horizon.sub[,c(1,2,3,26,27,28)])
+nrow(Horizon.sub)
+
+length(Horizon.sub$cokey)
+length(unique(Horizon.sub$cokey))
+
+#Subset Parent
+names(Parent4)
+head(Parent4)
+nrow(Parent4)
+Parent4.list<-c('cokey', 'pmkind', 'pmorigin')
+Parent.sub<-Parent4[,names(Parent4) %in% Parent4.list]
+head(Parent.sub)
+nrow(Parent.sub)
+
+#Merge everything to mukey; using cokey
+#need comppct from component table for % contribution of each component to each mukey (see below)
+
+#Merge Component and Horizon
+Comp1<-merge(Component.sub, Horizon.sub, by=c('cokey'))
+head(Comp1)
+nrow(Comp1)
+
+#Some mukeys are lost because of restriction to surface samples with depth <31 cm
+#e.g., 
+filter(Comp1, mukey==424124) #value is not present
+filter(Component.sub, mukey==424124) #it is present in the original Component table
+#so some mukeys only have attributes for bottom soil depths below 31 cm
+
+#how many mukeys are lost?
+
+#~10,000 mukeys lost, region wide
+
+#check for duplicates
+length(Comp1$cokey)
+length(unique(Comp1$cokey))
+#No duplicates
+
+
+#Merge in Parent table
+Comp2<-merge(Comp1, Parent.sub, by=c('cokey'))
+head(Comp2)
+nrow(Comp2)
+#check for duplicates
+length(Comp2$cokey)
+length(unique(Comp2$cokey))
+#No duplicates
+
+
+##################################################################
+#Summarize component scale attributes at the map unit scale
+#For numeric variables, take weighted average for each map unit; 
+#For categorical variable, take component with highest % of map unit;
+
+#weights are 'comppct_r'
+#i.e., the percent of each component in the map unit (the mukey)
+
+#For each numerical attribute at component scale, need to calculate weighted average
+#for each mukey (each group)
+
+#check column types to make sure each is designated as correct type
+#(either numeric or factor)
+
+sapply(Comp2, class)
+head(Comp2)
+names(Comp2)
+
+#use the transform method to change the in built type of each feature.
+#transform numeric variables
+Comp2 <- transform(
+  Comp2,
+  slope_r=as.numeric(slope_r),
+  slopelenusle_r=as.numeric(slopelenusle_r),  
+  elev_r=as.numeric(elev_r),
+  airtempa_r=as.numeric(airtempa_r),
+  reannualprecip_r=as.numeric(reannualprecip_r),
+  ffd_r=as.numeric(ffd_r),
+  sieveno4_r=as.numeric(sieveno4_r),
+  sieveno10_r=as.numeric(sieveno10_r),
+  sieveno40_r=as.numeric(sieveno40_r),
+  sieveno200_r=as.numeric(sieveno200_r),
+  sandtotal_r=as.numeric(sandtotal_r),
+  silttotal_r=as.numeric(silttotal_r),
+  claytotal_r=as.numeric(claytotal_r),
+  claysizedcarb_r=as.numeric(claysizedcarb_r),
+  om_r=as.numeric(om_r),
+  partdensity=as.numeric(partdensity),
+  ksat_r=as.numeric(ksat_r),
+  kffact=as.numeric(kffact),
+  caco3_r=as.numeric(caco3_r),
+  gypsum_r=as.numeric(gypsum_r),
+  freeiron_r=as.numeric(freeiron_r),
+  feoxalate_r=as.numeric(feoxalate_r),
+  extral_r=as.numeric(extral_r),
+  aloxalate_r=as.numeric(aloxalate_r),
+  pbray1_r=as.numeric(pbray1_r),
+  poxalate_r=as.numeric(poxalate_r),
+  ph2osoluble_r=as.numeric(ph2osoluble_r),
+  ptotal_r=as.numeric(ptotal_r),
+  comppct_r=as.numeric(comppct_r))
+
+#check levels for each categorical variables
+#note - random forest models can only handle categorical variables with a certain number of levels (53)
+
+levels(factor(Comp2$runoff)) # 6 levels
+levels(factor(Comp2$erocl)) # 5 levels
+levels(factor(Comp2$hydricon)) # 3 levels
+levels(factor(Comp2$hydricrating)) # 3 levels
+levels(factor(Comp2$drainagecl)) # 8 levels
+levels(factor(Comp2$geomdesc)) #4061 levels!! -->Exclude
+levels(factor(Comp2$taxpartsize)) #38 levels --> Combine? Or Exclude;
+#^^might be represented by other variables, e.g., % clay
+levels(factor(Comp2$taxceactcl)) #5 levels
+levels(factor(Comp2$taxreaction)) #7 levels
+levels(factor(Comp2$texcl)) #21 levels, could substitute for taxpartsize maybe
+levels(factor(Comp2$pmkind)) #65 levels -->could aggregate some levels
+levels(factor(Comp2$pmorigin)) #54 levels
+
+#Variables to exclude or modify (eg, aggregate or code dummy variables):
+#geomdesc, taxpartsize
+
+#for pmorigin, combine similar categories:
+#combine all organic materials
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Grassy organic material", "Organic material", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Herbaceous organic material", "Organic material", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Mossy organic material", "Organic material", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Woody organic material", "Organic material", Comp2$pmkind)
+#combine all types of till
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Basal till", "Till", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Flow till", "Till", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Lodgement till", "Till", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Melt-out till", "Till", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Subglacial till", "Till", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Supraglacial till", "Till", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Ablation till", "Till", Comp2$pmkind)
+#combine mine spoil
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Coal extraction mine spoil", "Mine spoil-coal or metal", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Metal ore extraction mine spoil", "Mine spoil-coal or metal", Comp2$pmkind)
+Comp2$pmkind<-ifelse(Comp2$pmkind=="Mine spoil or earthy fill", "Mine spoil-coal or metal", Comp2$pmkind)
+
+levels(factor(Comp2$pmkind))
+
+#transform categorical variables
+Comp2 <- transform(
+  Comp2,
+  runoff=as.factor(runoff),
+  erocl=as.factor(erocl),
+  hydricon=as.factor(hydricon),
+  hydricrating=as.factor(hydricrating),
+  drainagecl=as.factor(drainagecl),
+  taxpartsize=as.factor(taxpartsize),
+  taxceactcl=as.factor(taxceactcl),
+  taxreaction=as.factor(taxreaction),
+  texcl=as.factor(texcl),
+  pmkind=as.factor(pmkind),  
+  mukey=as.factor(mukey)
+)
+
+sapply(Comp2, class)
+
+
+#Note: i'm guessing you will also lose some levels when you merge to soil P data (subset of the country)
+
+#Check data:
+#check that numeric variables are numeric summaries
+#check that categorical variables are counts
+#check for missing data ('?')
+summary(Comp2)
+
+
+###
+#LIST OF NUMERIC & CATEGORICAL ATTRIBUTES
+
+Numeric.list<-c('slope_r', 'slopelenusle_r', 'elev_r', 
+                'airtempa_r', 'reannualprecip_r', 'ffd_r','sieveno4_r', 'sieveno10_r', 'sieveno40_r', 'sieveno200_r', 
+                'sandtotal_r', 'silttotal_r', 'claytotal_r', 'claysizedcarb_r', 'om_r', 'partdensity',
+                'ksat_r', 'kffact', 'caco3_r', 'gypsum_r')
+
+Categorical.list<-c('mukey', 'comppct_r', 'runoff', 'erocl', 'hydricon', 'hydricrating', 'drainagecl', 'taxpartsize',
+                    'taxceactcl', 'taxreaction', 'texcl', 'pmkind')
+
+
+#Variables to exclude: 
+#geomdesc - too many levels
+#almost no or no data; 'freeiron_r', 'feoxalate_r', 'extral_r', 
+#'aloxalate_r', 'pbray1_r', 'poxalate_r', 'ph2osoluble_r', 'ptotal_r'
+
+##SUMMARIZE ATTRIBUTES:
+
+#NUMERIC
+#calculate weighted mean for each mukey (weights are % contribution to mukey area) 
+#calculate for multiple attributes at once
+#note: for weighted mean approach attributes must be numeric
+
+#library(dplyr)
+names(Comp2)
+
+Mukey.mean<-Comp2 %>% group_by(mukey) %>% 
+  summarise_at(Numeric.list, 
+               list(~weighted.mean(., comppct_r)))
+
+head(Mukey.mean)
+
+#make into a regular table
+Mukey.mean<-as.data.frame(Mukey.mean)
+head(Mukey.mean)
+
+#check for duplicates
+length(Mukey.mean$mukey)
+length(unique(Mukey.mean$mukey))
+#no duplicates
+
+#CATEGORICAL
+#select component level with the highest percentage area in the map unit
+#if two component levels are tied for area, use tie breaker (see below)
+#highest compcct_r for each attribute in each mutkey
+
+#group by mukey
+#apply just across columns in Categorical.list
+#select attribute levels in each group based on max compcct_r
+
+# convert to data.table with key=mukey
+Comp.table <- data.table(Comp2[,Categorical.list], key="mukey")
+# get the subset of data that matches this criterion
+Mukey.top2<-unique(Comp.table[, .SD[comppct_r %in% max(comppct_r)], by=mukey])
+head(Mukey.top2)
+
+#check for duplicates
+length(Mukey.top2$mukey)
+length(unique(Mukey.top2$mukey))
+
+#Are some duplicates here - for some map units, multiple components have same area
+#Need to further winnow down - see below
+
+
+###
+##So now you have:
+#weighted average for numeric variables for each map unit
+#component with highest percentage area in map unit for categorical variables
+
+#Merge the two;
+SSURGO.att<-merge(Mukey.mean, Mukey.top2, by=c('mukey'))
+head(SSURGO.att)
+#check for duplicates
+length(SSURGO.att$mukey)
+length(unique(SSURGO.att$mukey))
+
+#Add in attributes from Valu1 table
+SSURGO.all<-merge(SSURGO.att, valu1, by=c('mukey'))
+head(SSURGO.all)
+
+#check for duplicates
+length(SSURGO.all$mukey)
+length(unique(SSURGO.all$mukey))
+
+#are some duplicates - due to multiple components of same area in some map units
+#Choose higher slope as the tie breaker, because surface P runoff increases for soils with greater slope
+#select rows with highest slope in each mukey
+names(SSURGO.all)
+
+SSURGO.top<-as.data.frame(
+  SSURGO.all %>% group_by(mukey) %>% top_n(1, slope_r))
+head(SSURGO.top)
+
+#check for duplicates
+length(SSURGO.top$mukey)
+length(unique(SSURGO.top$mukey))
+
+#Still some duplicates above -- Choose a row at random, as a second tie breaker
+SSURGO.unique <- SSURGO.top[!duplicated(SSURGO.top$mukey),]
+head(SSURGO.unique)
+
+#check for duplicates
+length(SSURGO.unique$mukey)
+length(unique(SSURGO.unique$mukey))
+#Now have unique records
+
+#write to table;
+#these are unique attributes for each map unit, from multiple SSURGO tables
+
+write.table(SSURGO.unique, './SSURGO_attributes_unique_for_mapunit_Delta.csv', sep=",", row.names=FALSE)
+
+```
+
+### Module 4: Merge and clean up all attributes
+
+```{r}
+# STEP 4: LOAD IN SOIL P Locations w/SPATIAL ATTRIBUTES #
+#& MERGE WITH SSURGO & STREAMCAT ATTRIBUTES #
+
+#soil P datasets have had the following pre-processing:
+
+#NHD stream type from NHDv2Plus, if within 100 m buffer of stream network
+#NWI wetland type, if within wetland polygon
+#NLCD 2019 Land Use category in 30m cell where sample occurs
+#SSURGO mutkey ID (for merging with ssurgo attributes - see below)
+#NHDv2Plus Catchment COMID (for merging with StreamCat attributes - see below)
+
+#Load in Soil P locations
+soilP<-read.delim('./Attributes_for_soilP_model.csv', sep=',',header=TRUE)
+head(soilP)
+names(soilP)
+
+#Format column headers to match existing soil P script:
+soilP<-soilP %>% 
+  rename(FTYPE=ftype) %>% 
+  rename(FCODE=fcode) %>% 
+  rename(NLCD19=NLCDCat) %>% 
+  rename(LONGITUDE=x) %>% 
+  rename(LATITUDE=y) %>% 
+  rename(WETLAND_TYPE=WETLAND_TY) %>% 
+  rename(MUTKEY=MUKEY)
+
+#Check # of unique sample locations
+nrow(unique(soilP[c("LATITUDE","LONGITUDE")]))
+
+
+#Attributes to keep:
+Attributes.Keep<-c('LATITUDE', 'LONGITUDE', 'COMID', 'MUTKEY', 'FTYPE', 'FCODE', 'WETLAND_TYPE', 
+                      'NLCD19')
+
+soilP2<-soilP[,names(soilP) %in% Attributes.Keep]
+names(soilP2)
+
+###########################################################
+##ADDITIONAL PREDICTOR VARIABLES
+
+#load in additional SSURGO (soil) attributes
+ssurgo<-read.delim('./SSURGO_attributes_unique_for_mapunit_Delta.csv', sep=",", header=TRUE)
+head(ssurgo)
+names(ssurgo)
+
+
+###############################################################
+
+##MERGE SOIL P DATA TO PREDICTOR VARIABLES
+
+
+#For USGS GEOCHEM DATA + NCSS TP DATA:
+soilP.att<-merge(soilP2, ssurgo, by=c('MUTKEY'))
+head(soilP.att)
+names(soilP.att)
+nrow(soilP.att)
+
+
+####
+#Create Levels for Categorical Attribute data
+
+#set NA to 0 for FCODE
+soilP.att$FCODE[is.na(soilP.att$FCODE)] <- 0
+head(soilP.att)
+
+#Check levels for streams layer
+levels(factor(soilP.att$FCODE))
+
+#Create levels for streams layer;
+#levels are: 
+soilP.att$StreamType<-factor(soilP.att$FCODE, levels=c('0', '33600', '46003', '46006', '55800'),
+                             labels=c('NonStream', 'Canal/Ditch', 'Intermittent_Stream', 'Perennial_Stream', 'Artificial_Path'))
+
+
+#Create categorical variable for NWI categories
+names(soilP.att)
+levels(factor(soilP.att$WETLAND_TYPE))
+soilP.att$WetlandType<-factor(soilP.att$WETLAND_TYPE, levels=c( 
+                                                               'Freshwater Forested/Shrub Wetland'),
+                              labels=c('Freshwater Forested/Shrub Wetland'))
+head(soilP.att)
+levels(soilP.att$WetlandType)
+
+
+#NLCD 2019 Land Use category - note this category has some overlap with NWI
+#check number of levels
+levels(factor(soilP.att$NLCD19))
+#15 levels should be OK
+#create categorical variable
+#1 - 21 - Developed, Open Space
+#2 - 22 - Developed, Low Intensity
+#3 - 23 - Developed, Medium Intensity
+#12 - 82 - Cultivated Crops
+#13 - 90 - Woody Wetlands
+#14 - 95 - Emergent Herbaceous Wetlands
+
+
+######################################################
+#SUBSET COLUMNS to bind to StreamCat dataset:
+names(soilP.att)
+head(soilP.att)
+
+Numeric.list<-c('P_mgkg',
+                'p_ox', 'p_bray1', 'pbray2', 'p_olsn', 'p_nz', 'p_h2o', 'p_citx', 'p_mehlich3', 'n_no3',
+                'slope_r', 'slopelenusle_r', 'elev_r', 
+                'airtempa_r', 'reannualprecip_r', 'ffd_r','sieveno4_r', 'sieveno10_r', 'sieveno40_r', 'sieveno200_r', 
+                'sandtotal_r', 'silttotal_r', 'claytotal_r', 'claysizedcarb_r', 'om_r', 'partdensity',
+                'ksat_r', 'kffact', 'caco3_r', 'gypsum_r',
+                'aws0_5', 'aws5_20', 'aws20_50', 'aws50_100', 'aws100_150', 'aws150_999', 'aws0_20', 'aws0_30',
+                'aws0_100', 'aws0_150', 'aws0_999','soc0_5' , 'soc5_20' ,'soc20_50'                   
+                , 'soc50_100' ,'soc100_150', 'soc150_999' ,'soc0_20'                    
+                , 'soc0_30' ,'soc0_100' , 'soc0_150','soc0_999'                                                 
+                , 'nccpi3corn' ,'nccpi3soy' , 'nccpi3cot','nccpi3sg'                   
+                , 'nccpi3all','pctearthmc' , 'rootznemc','rootznaws'                  
+                , 'droughty','pwsl1pomu', 'Depth_cm')
+
+Categorical.list<-c('mukey', 'comppct_r', 'runoff', 'erocl', 'hydricon', 'hydricrating', 'drainagecl', 'taxpartsize',
+                    'taxceactcl', 'taxreaction', 'texcl', 'pmkind', 'Wetland_Attribute', 'StreamType',
+                    'WetlandType', 'NLCD19')
+
+Admin.list<-c('SiteID', 'mukey', 'site_key', 'latitude_decimal_degrees', 'longitude_decimal_degrees', 'state_name', 
+              'county_code', 'county_name', 'labsampnum', 
+              'hzn_top', 'hzn_bot',
+              'hzn_desgn', 'hzn_prime', 'COMID','FEATUREID', 'musumcpct','COMID.x', 'COMID.y', 'COMID')
+
+#musumcpct - the sum of comppct_r values for all listed components in the map unit
+
+Location.list<-c('LATITUDE', 'LONGITUDE')
+
+Big.List<-c(Numeric.list, Categorical.list, Admin.list, Location.list)
+
+
+#Subset data to the attributes specified above:
+data<-soilP.att[,names(soilP.att) %in% Big.List]
+head(data)
+names(data)
+nrow(data)
+
+
+################################################
+##ADD IN STREAM CAT VARIABLES 
+streamcat<-fread('./StreamCat/StreamCat_merged_data.csv', sep=",", header=TRUE)
+head(streamcat)
+names(streamcat)
+
+#MERGE STREAMCAT TO ALL SOIL P DATA
+All.Att<-merge(data, streamcat, by=c('COMID'))
+head(All.Att)
+nrow(All.Att)
+
+```
+
+#### Matching NLCD land cover years
+
+-   The original soil P model for the UMRB was built with 2006 NLCD data.
+
+-   It probably makes more sense to use the closest matching NLCD to when soil samples were collected (assuming 2019 for Mississippi Delta soil samples)
+
+    -   Drop 2006 attributes from attribute list
+
+    -   Label 2019 attributes as "2006" even though they are actually 2019!
+
+-   See file "streamcat_variable_info_downloaded_072424.csv" for more info on StreamCat attributes at the time this script was written
+
+-   Alternatively, you could use 2006 NLCD variables for Mississippi, because they match (not taking this approach for now)
+
+```{r}
+
+#Drop 2006 attributes from the attribute list, EXCEPT "PctAg2006Slp10Ws, as 2006 appears to be the only year for which this attribute exists (even tho streamcat variable list says it should exist for multiple NLCD series)
+
+ncol(All.Att)
+
+All.Att.cor <- All.Att[, !(grepl("2006", names(All.Att)) & names(All.Att) != "PctAg2006Slp10Ws")]
+
+ncol(All.Att.cor) #check number of remaining columns
+
+
+#Replace 2019 attributes with "2006"
+colnames(All.Att.cor) <- gsub("2019", "2006", colnames(All.Att.cor))
+
+#Similarly, rename the NLCD19 column to match dataset used to build model:
+All.Att.cor<-All.Att.cor %>% 
+  rename(NLCD06Cat=NLCD19) %>% 
+  mutate(CatPctFull=100) %>% 
+  mutate(WsPctFull=100)
+
+#Create CatPctFull and WsPctFull columns (these typically don't contain useful information anyway)
+
+
+#################################################################
+###EXCLUDE VARIABLES:
+
+#For this dataset, we need the same attributes that were used to build the original soil P model for the UMRB. 
+
+#Load in attribute data for the original soil P model in the UMRB:
+UMRB<-read.delim("./_UMRB_Soil_P_data_for_modelling.txt", sep=",", header=TRUE)
+head(UMRB)
+names(UMRB)
+
+Orig.List<-colnames(UMRB)
+Orig.List
+
+#Find columns missing from MS Delta dataset that are in original UMRB dataset:
+
+Orig.List[!Orig.List %in% colnames(All.Att.cor)]
+
+#Temperature and Precip columns appear to have been updated since UMRB model was built
+#Based on the streamcat variable list, "Precip8110" are the 30 year average values 1981-2010, Precip9120 are 30 year average balues 1991-2020
+
+#In previous model, used mean values from 2008
+#used 30 year averages from 1981-2010
+
+#For this model, use mean values from 2008
+#Use 30 year averages from 1981-2010
+
+#Looks like "PctAg2006Slp10Ws" was renamed to "PctAgSlpMid[Year][AOI]" in StreamCat dataset
+
+
+All.Att.cor %>% 
+  dplyr::select(contains(c("Precip","Tmean","Tmax","Tmin"))) %>% names()
+
+All.Att.cor2<-All.Att.cor %>% 
+  rename(PrecipCat=Precip08Cat) %>% 
+  rename(PrecipWs=Precip08Ws) %>% 
+  rename(TmaxCat=Tmax8110Cat) %>% 
+  rename(TminCat=Tmin8110Cat) %>% 
+  rename(TmeanCat=Tmean08Cat) %>% 
+  rename(TmaxWs=Tmax8110Ws) %>% 
+  rename(TminWs=Tmin8110Ws) %>% 
+  rename(TmeanWs=Tmean08Ws) 
+
+#Check column matching again
+
+Orig.List[!Orig.List %in% colnames(All.Att.cor2)]
+#P_mgkg and Depth_cm are missing and need to be added by Fanyu
+
+
+#Select only columns that were in original Soil P UMRB dataset:
+All.Att.select<-All.Att.cor2 %>% 
+  dplyr::select(c(LATITUDE, LONGITUDE, any_of(Orig.List)))
+
+
+
+names(All.Att.select)
+
+
+```
+
+```{r}
+#Write the final attributes data to file 
+
+write.table(All.Att.select, "./soil_sample_attributes_data_for_modelling_Delta.csv", sep=",", row.names=FALSE)
+
+
+
+```
+
+## Assign attributes for grid of unsampled locations in the Mississippi Delta (to use in soil P predictions)
+
+This repeats all of the processing steps above, for a grid of unsampled locations.
+
+Note that it might be wise to include approach to account for spatial autocorrelation in soil P.
+
+#### Load in grid of unsampled points and study area:
+
+```{r}
+grid<-fread("./DeltaP_grid_coords_100m.csv", sep=",", header=TRUE)  
+head(grid) 
+nrow(grid) 
+
+#create shapefile of locations  
+grid_sf <- st_as_sf(grid, coords = c("xcord","ycord")) 
+grid_sf  
+
+#Set coordinate reference system to NAD83 
+st_crs(grid_sf) = 4269 #set crs to NAD83 st_crs(grid_sf) 
+
+#Read in study area:
+HUC4_contig<-st_read("./spatial_data/HUC4_contig.shp")
+crs(HUC4_contig)
+```
+
+#### Intersect unsampled grid with 100m buffers around NHD to assign stream type
+
+```{r}
+#load in buffered nhd
+nhdbuffer_100m<-st_read("./spatial_data/nhdbuffer_100m.shp")   
+crs(nhdbuffer_100m)
+names(nhdbuffer_100m)
+head(nhdbuffer_100m)
+
+#Join NHD ID to unsampled grid:
+#see how long it takes 
+names(grid_sf)
+start.time <- Sys.time()  
+
+grid_NHD<-st_join(grid_sf, nhdbuffer_100m, join=st_within, left="TRUE")  
+end.time <- Sys.time() 
+time.taken <- round(end.time - start.time,2) 
+time.taken
+
+nrow(grid_NHD) #getting additional rows from join - points in >1 nhd buffer? --> yes, confirmed in ArcGIS
+
+#Number of rows within NHD buffer
+grid_NHD %>% filter(!is.na(fcode)) %>% count()
+
+#Look at example of duplicates
+head(grid_NHD[duplicated(grid_NHD$OID_),])
+
+
+#If duplicates do not provide distinct information about stream ftype, elimate duplicate:
+#(note: this takes a long time; could speed it up by dropping geometry)
+grid_NHD2<-grid_NHD %>% 
+  distinct(OID_, fcode, .keep_all = T)
+nrow(grid_NHD2)
+
+
+#Are still some distinct duplicates
+levels(factor(grid_NHD2$fcode))
+
+#Note different stream types associated with fcode:
+#levels=c('0', '33400', '33600', '46000', 46003', '46006', '55800')
+#labels=c('NonStream', 'Canal/Ditch', 'StreamRiver', Intermittent_Stream', 'Perennial_Stream', 'Artificial_Path', 'Connector'))
+
+#Select one NHD buffer type for each grid location, based on which is likely to be most influential
+#Hierarchy of NHD buffers:
+#No stream > Perennial stream > StreamRiver >intermittent stream > canal/ditch > artificial path 
+
+# Define the priority order (highest to lowest) of NHD buffer types
+priority_order <- c(NA, "46006", "46000", "46003", "33600", "55800", "33400")
+
+
+# Create a numeric rank for the priority
+grid_NHD3 <- grid_NHD2 %>%
+  mutate(priority_rank = match(fcode, priority_order))  # Assign ranks based on priority
+head(grid_NHD3)
+names(grid_NHD3)
+
+# Group by the OID_ column and keep the record with the highest priority in each group
+#Also! exclude COMID as you don't need this info, and you will need COMID later when you join to NHD catchment layer
+filtered_gridNHD <- grid_NHD3 %>%
+  dplyr::select(!comid) %>% 
+  group_by(OID_) %>%
+  slice_min(order_by = priority_rank) %>%  # Keep the record with the lowest numeric rank (highest priority)
+  ungroup() 
+
+nrow(filtered_gridNHD)
+nrow(grid_sf)
+names(filtered_gridNHD)
+
+#Now are back to original number of rows
+st_write(filtered_gridNHD, "./spatial_data/filtered_gridNHD.shp")
+
+
+
+```
+
+#### Assign COMID for NHD catchment to unsampled grid:
+
+```{r}
+
+#Read in grid with attributes attached so far:
+filtered_gridNHD<-st_read("./spatial_data/filtered_gridNHD.shp")
+crs(filtered_gridNHD)
+names(filtered_gridNHD)
+View(head(filtered_gridNHD))
+
+#Get NHD catchment boundaries, using nhdplusTools  
+
+NHD_catchment<-get_nhdplus(AOI = HUC4_contig,   comid = NULL,   nwis = NULL,   realization = "catchment",   streamorder = NULL,   t_srs = NULL ) 
+crs(NHD_catchment) 
+
+#Join NHD Catchment ID to unsampled grid:
+#see how long it takes 
+start.time <- Sys.time()  
+
+grid_COMID <- st_join(filtered_gridNHD, NHD_catchment, join = st_intersects) 
+
+end.time <- Sys.time() 
+time.taken <- round(end.time - start.time,2) 
+time.taken
+
+nrow(grid_COMID)
+#nrow(grid_sf)
+names(grid_COMID)
+
+#Create COMID attribute from featureid 
+grid_COMID<-grid_COMID %>%    
+  rename(COMID=featureid)  %>% 
+  dplyr::select(c("OID_", "ftype", "fcode", "COMID", "geometry"))  
+
+names(grid_COMID)
+
+#Check for NAs (shouldn't be any)
+grid_COMID %>% st_drop_geometry() %>% filter(is.na(COMID)) %>% count()
+#Ok, these NAs are outside the state of MS I believe
+
+#Save intermediate file
+st_write(grid_COMID, "./spatial_data/grid_COMID.shp")
+```
+
+#### Assign Wetlands attributes to unsampled grid:
+
+```{r}
+
+#Read in clipped wetlands layer for study region:
+wetlandsHUC4<-st_read("./spatial_data/NWI_wetlandsHUC4.shp")
+crs(wetlandsHUC4)
+st_crs(wetlandsHUC4)
+names(wetlandsHUC4)
+
+#Project grid locations into NAD83 Albers to match wetlands layer:
+grid_COMID_projAlbers<-st_transform(grid_COMID, crs=st_crs(wetlandsHUC4))
+
+
+#Join wetland attributes to unsampled grid
+#see how long it takes 
+start.time <- Sys.time()  
+
+grid_NWI <- st_join(grid_COMID_projAlbers, wetlandsHUC4, join = st_intersects)
+
+end.time <- Sys.time() 
+time.taken <- round(end.time - start.time,2) 
+time.taken
+
+nrow(grid_NWI)
+
+#Picking up additional rows
+names(grid_NWI)
+
+#Look at example of duplicates
+head(grid_NWI[duplicated(grid_NWI$OID_),])
+
+#Eliminate duplicates without distinct info:
+grid_NWI2<-grid_NWI %>% 
+  distinct(OID_, WETLAND_TY, .keep_all = T)
+nrow(grid_NWI2) #correct number of rows 
+
+names(grid_NWI2)
+
+#save intermediate file
+st_write(grid_NWI2, "./spatial_data/grid_NWI2.shp")
+
+#read in intermediate file for operations below
+grid_NWI2<-st_read("./spatial_data/grid_NWI2.shp")
+
+#Check that things look OK:
+View(head(grid_NWI2))
+levels(factor(grid_NWI2$fcode))
+nrow(grid_NWI2)
+```
+
+#### Assign NLCD to unsampled grid:
+
+```{r}
+# Download the NLCD data for the specified AOI
+#Note you are using 2019 NLCD data here:
+nlcd_data <- get_nlcd(template = HUC4_contig, label = "NLCD_HUC4", year = 2019, dataset = "landcover")
+head(nlcd_data)
+
+#check reference system
+st_crs(nlcd_data)
+st_crs(grid_NWI2)
+
+#Project NLCD to NAD83 Albers:
+target_crs<-crs(grid_NWI2)
+nlcd_projAlbers <- terra::project(nlcd_data, target_crs)
+
+# Extract the raster value at the point location
+grid_NLCD <- extract(nlcd_projAlbers, grid_NWI2)
+
+#Bind NLCD attributes to other attributes:
+grid_NHD_NWI_NLCD<-cbind(grid_NWI2, grid_NLCD)
+
+#Make simpler file name:
+grid_3<-grid_NHD_NWI_NLCD
+
+#Rename NLCD attribute
+grid_3<-grid_3 %>% 
+  rename(NLCDCat=Class)
+nrow(grid_3)
+
+View(head(grid_3))
+```
+
+#### Read in SSURGO attributes:
+
+First link grid locations to mukey
+
+Then load previously processed ssurgo attributes (processed above), and link to grid locations by mukey
+
+```{r}
+
+#AR_mu <- sf::st_read(dsn = "./spatial_data/gSSURGO_AR.gdb", layer = "MUPOLYGON")
+
+#Read in Mississippi SSURGO data:
+MS_mu<-sf::st_read(dsn = "./spatial_data/gSSURGO_MS.gdb", layer = "MUPOLYGON")
+
+View(head(MS_mu))
+
+#IF NEEDED, Combine all map unit maps into a single map:
+#Note: below you are just using ssurgo data from MS
+#MU.map <- st_make_valid(rbind(AR_mu, MS_mu))
+#View(head(MU.map))
+#crs(MU.map)
+#names(MU.map)
+
+#Check map of SSURGO map units:
+#plot(MU.map["MUSYM"])
+
+#Look at original mapunit shapefiles:
+#tm_shape(MS_mu[1:500,])+
+#  tm_polygons()
+
+#Note slightly different CRS
+#Get CRS of grid to match exactly
+
+grid_3_NAD83ConusAlbers<-st_transform(grid_3, crs=st_crs(MS_mu))
+crs(grid_3_NAD83ConusAlbers)
+nrow(grid_3_NAD83ConusAlbers)
+
+
+#Check bounding areas of two layers:
+st_bbox(MU.map)
+st_bbox(grid_3_NAD83ConusAlbers)
+
+
+#Check spatial extent of layers:
+tmap_mode("view")
+
+MS_HUC4_NAD83ConusAlbers<-st_transform(MS_HUC4, crs=st_crs(MS_mu))
+MS_sf_NAD83ConusAlbers<-st_transform(MS_sf, crs=st_crs(MS_mu))
+
+tm_shape(MS_HUC4_NAD83ConusAlbers)+
+  tm_borders(col="blue")+
+  tm_text("name", size = 0.5, col = "black", just = "center")+
+tm_shape(MS_sf_NAD83ConusAlbers) +
+  tm_borders()+
+tm_shape(grid_3_NAD83ConusAlbers[1:500,])+
+  tm_dots()+
+tm_shape(MU.map[1:500,])+
+  tm_polygons()
+  
+
+plot(grid_3_NAD)
+
+
+#Join gSSURGO mapunit attributes to soil sample locations:
+#Using just MS data to start: 
+
+start.time<-Sys.time()
+start.time
+
+grid_ssurgo <- st_join(grid_3_NAD83ConusAlbers, MS_mu %>% dplyr::select(MUKEY, MUSYM), join = st_intersects, left=TRUE)
+
+end.time <- Sys.time() 
+time.taken <- round(end.time - start.time,2) 
+time.taken
+
+levels(factor(grid_ssurgo$MUKEY))
+nrow(grid_ssurgo)
+View(head(grid_ssurgo))
+
+#Why are some MUKEY values NA??
+#Count number of records that are NA for MUKEY
+names(grid_ssurgo)
+grid_ssurgo %>% 
+  st_drop_geometry() %>% 
+  filter(is.na(MUKEY)) %>% 
+  count()
+27611/1917011 #1.4% are NA, something going wrong here (sites outside MS?)
+
+#Lets look where non NA sites are:
+tmap_mode("view")
+
+
+#Write spatial data with all attribute keys to file:
+start.time<-Sys.time()
+
+st_write(grid_ssurgo, "./spatial_data/grid_NHD_NWI_NLCD_gSSURGO_Ms.shp", append=FALSE)
+
+end.time<-Sys.time()
+total.time<-end.time-start.time
+total.time
+
+#read in spatial data if needed:
+grid_ssurgo<-st_read("./spatial_data/grid_NHD_NWI_NLCD_gSSURGO_Ms.shp")
+
+#Note NAs for NLCDCat
+#Number occurring outside of MS:
+grid_ssurgo %>% st_drop_geometry() %>% filter(is.na(NLCDCat)) %>% count
+
+29079/1917011 #1.5% of grid points
+
+
+```
+
+#### Load in SSURGO attributes, and link to grid locations by mukey
+
+Also exclude grid points outside of the two HUC4s that encompassed the original 84 data points from Mississippi
+
+```{r}
+
+#load in additional SSURGO (soil) attributes
+ssurgo<-read.delim('./SSURGO_attributes_unique_for_mapunit_Delta.csv', sep=",", header=TRUE)
+head(ssurgo)
+names(ssurgo)
+
+#Check for NA values in mukey
+ssurgo %>% filter(is.na(MUTKEY)) %>% count() #No NA values 
+
+#need to join ssurgo attributes by mukey to grid locations 
+#(note: this is a little slow - takes a few minutes)
+#Keep spatial info in merge so can plot locations:
+grid_spatial<-merge(grid_ssurgo %>% 
+  rename(mukey=MUKEY) %>% 
+    filter(!is.na(NLCDCat)), ssurgo, by=c("mukey"), all.x=TRUE)
+
+```
+
+#### Figuring out missing mukey values:
+
+Update: After exploring in ArcGIS - Grid points with missing soil attributes:
+
+Some of those points are along rivers
+
+Some are in "square like" features
+
+Checked and one example wasn't in chorizon table
+
+These might be "non soil" map units, and therefore not have all accompanying information (such as horizon characteristics eg).
+
+OR they might be associated with depths that don't match the filter i used of \<=31cm
+
+See script: ssurgo_troubleshooting_script.R
+
+Also See notes at: <https://docs.google.com/document/d/11VIkIboKCxoF7KrfUFtgw_KYKkwf0nnCiXG72FXdE_o/edit?usp=sharing>
+
+```{r}
+#Note: additional grid points were lost in merge with ssurgo attributes - WHY?? 
+#(this happened when doing a normal merge, before setting all.x=TRUE)
+
+#Look at attributes for these sites
+View(grid_spatial %>% filter(is.na(MUTKEY)))
+
+#Check levels for MUSYM and mukey
+#Which mukeys are missing?
+
+grid_spatial %>%
+  st_drop_geometry() %>% 
+  filter(is.na(MUTKEY)) %>% 
+  #dplyr::select(MUSYM) %>% 
+  dplyr::select(mukey) %>% 
+  mutate(mukey=factor(mukey)) %>% 
+  sapply(levels)
+
+#Variety of MUSYM and mukey have missing MUTKEY
+#Variety of land use (not all open water, eg) have missing MUTKEY
+
+#check points with NA values for mukey (ie, points in the grid data set that don't have ssurgo attributes in the SSURGO_attributes_unique_for_mapunit_Delta file)
+
+grid_data_att %>% filter(is.na(MUTKEY)) %>% count()
+
+
+nrow(grid_spatial)
+
+grid_spatial %>% st_drop_geometry() %>% filter(is.na(MUTKEY)) %>% count()
+154275/nrow(grid_spatial) #8% of remaining points don't have soil attribute info 
+
+
+#where are these NA values located
+
+#write points with NA values to file so can look at in ArcGIS:
+
+st_write(grid_spatial %>% filter(is.na(MUTKEY)), "./spatial_data/grid_NA_mukey.shp")
+
+
+#Need state of MS and HUC4 boundaries:
+#read in USA state boundaries using tigris package
+states<-states()
+states_sf <- st_as_sf(states) #convert to sf object
+st_bbox(states_sf) #bounding box
+states_sf
+
+st_crs(states_sf) #check reference system
+
+
+#Select states of Mississippi
+MS_sf<-states_sf %>% filter(STUSPS=="MS")
+HUC4_contig<-st_read("./spatial_data/HUC4_contig.shp")
+
+
+#Check spatial reference
+crs(HUC4_contig)
+crs(MS_sf)
+crs(grid_data_att)
+
+#Map grid points with mukey info missing:
+tm_shape(MS_sf)+
+  tm_borders(col="purple", lwd=0.5)+
+#tm_shape(HUC4_contig)+
+  tm_borders(col="blue")+
+tm_shape(grid_spatial %>% filter(is.na(MUTKEY)))+
+  tm_dots()+
+tm_shape(grid_spatial %>% filter(!is.na(MUTKEY)) %>% head(500))+
+           tm_dots(col="red")
+
+```
+
+Format and clean up grid attributes added so far (before adding streamcat):
+
+```{r}
+#Grid with existing attributes:
+names(grid_spatial)
+
+#Clean up the data a little to remove missing data and to match existing soil P script 
+grid_clean<-grid_spatial %>% 
+  st_drop_geometry() %>% 
+  filter(!is.na(NLCDCat)) %>% 
+  filter(!is.na(MUTKEY)) %>% 
+  rename(FTYPE=ftype) %>% 
+  rename(FCODE=fcode) %>% 
+  rename(NLCD19=NLCDCat) %>% 
+  rename(WETLAND_TYPE=WETLAND_TY)
+
+names(grid_clean)
+nrow(grid_clean)
+
+####
+#Create Levels for Categorical Attribute data
+
+#set NA to 0 for FCODE
+grid_clean %>% filter(is.na(FCODE)) %>% count()
+grid_clean$FCODE[is.na(grid_clean$FCODE)] <- 0
+
+#Check levels for streams layer
+levels(factor(grid_clean$FCODE))
+
+#Create levels for streams layer;
+#levels are:
+#Note new levels add with this dataset:
+
+# "33400" - "Connector" (non specific) --> assign to Artificial Path
+grid_clean$FCODE[grid_clean$FCODE=="33400"]<-'55800'
+
+#"46000" -  Stream/River - no data on intermittent vs perennial
+#assume perennial 
+
+grid_clean$FCODE[grid_clean$FCODE=="46000"]<-'46006'
+
+#Check levels after reassignment:
+levels(factor(grid_clean$FCODE))
+
+ 
+grid_clean$StreamType<-factor(grid_clean$FCODE, levels=c('0', '33600', '46003', '46006', '55800'),
+                             labels=c('NonStream', 'Canal/Ditch', 'Intermittent_Stream', 'Perennial_Stream', 'Artificial_Path'))
+
+
+#Create categorical variable for NWI categories
+levels(factor(grid_clean$WETLAND_TYPE))
+#There are no non wetland sites!? 
+#Check that:
+grid_clean %>% filter(is.na(WETLAND_TYPE)) %>% count()
+#Ok, there are non wetlands. Need a category level
+#Assign missing value to NA
+#set NA to 0 for WETLAND_TYPE
+grid_clean$WETLAND_TYPE[is.na(grid_clean$WETLAND_TYPE)] <- 0
+
+
+
+#Other is a category that wasn't used to build the model...
+#how many points have "Other" as category?
+
+grid_clean %>% filter(WETLAND_TYPE=="Other") %>% count()
+#Check if these are actually wetlands? --> Look in ArcGIS
+#Update:
+#These have attribute "Pf" for Palustrine farmed - 
+#see https://www.lccmr.mn.gov/projects/2013/finals/2013_03d_FINAL_PIGuide.pdf, p. 35
+
+
+grid_clean$WetlandType<-factor(grid_clean$WETLAND_TYPE, levels=c('0', 'Freshwater Emergent Wetland','Freshwater Forested/Shrub Wetland','Freshwater Pond', 'Lake', 'Other', 'Riverine'), labels=c('NonWetland','Freshwater Emergent Wetland', 'Freshwater Forested/Shrub Wetland',
+                                       'Freshwater Pond', 'Lake', 'Farmed Wetland', 'Riverine'))
+
+levels(grid_clean$WetlandType)
+
+
+#NLCD 2019 Land Use category 
+#check number of levels
+levels(factor(grid_clean$NLCD19))
+
+#check NLCD levels of original dataset
+#Load in attribute data for the original soil P model in the UMRB:
+UMRB<-read.delim("./_UMRB_Soil_P_data_for_modelling.txt", sep=",", header=TRUE)
+head(UMRB)
+names(UMRB)
+
+levels(factor(UMRB$NLCD06Cat))
+#OK same levels, but some need to be renamed to match original model
+#Note there are some typos here! but keeping them to match original model
+
+grid_clean$NLCD06Cat<-factor(grid_clean$NLCD19,
+labels=c('Barren Land', 'Cultivated Crops', 
+'Deciduous Forest', 'Developed, High Intensity', 
+'Developed, Low Intensity', 'Developed, Medium Intensity', 'Developed, Open Space', 'Emergent Herbaious Wetlands', 'Evergreen Forest', 'Grassland/Herbaceous', 'Mixed Forest','Open Water', 'Pasture/Hay', 'Shrub/Scrub', 'Woody Wetlands')) 
+                                     
+##Need to make a Depth_cm column
+grid_clean$Depth_cm<-"5"
+
+######################################################
+#SUBSET COLUMNS to bind to StreamCat dataset:
+names(grid_clean)
+
+Numeric.list<-c('Depth_cm',
+                'p_ox', 'p_bray1', 'pbray2', 'p_olsn', 'p_nz', 'p_h2o', 'p_citx', 'p_mehlich3', 'n_no3',
+                'slope_r', 'slopelenusle_r', 'elev_r', 
+                'airtempa_r', 'reannualprecip_r', 'ffd_r','sieveno4_r', 'sieveno10_r', 'sieveno40_r', 'sieveno200_r', 
+                'sandtotal_r', 'silttotal_r', 'claytotal_r', 'claysizedcarb_r', 'om_r', 'partdensity',
+                'ksat_r', 'kffact', 'caco3_r', 'gypsum_r',
+                'aws0_5', 'aws5_20', 'aws20_50', 'aws50_100', 'aws100_150', 'aws150_999', 'aws0_20', 'aws0_30',
+                'aws0_100', 'aws0_150', 'aws0_999','soc0_5' , 'soc5_20' ,'soc20_50'                   
+                , 'soc50_100' ,'soc100_150', 'soc150_999' ,'soc0_20'                    
+                , 'soc0_30' ,'soc0_100' , 'soc0_150','soc0_999'                                                 
+                , 'nccpi3corn' ,'nccpi3soy' , 'nccpi3cot','nccpi3sg'                   
+                , 'nccpi3all','pctearthmc' , 'rootznemc','rootznaws'                  
+                , 'droughty','pwsl1pomu', 'Depth_cm')
+
+Categorical.list<-c('mukey', 'comppct_r', 'runoff', 'erocl', 'hydricon', 'hydricrating', 'drainagecl', 'taxpartsize',
+                    'taxceactcl', 'taxreaction', 'texcl', 'pmkind', 'Wetland_Attribute', 'StreamType',
+                    'WetlandType', 'NLCD06Cat')
+
+Admin.list<-c('OID_', 'COMID', 'mukey',  
+               'musumcpct')
+
+#musumcpct - the sum of comppct_r values for all listed components in the map unit
+
+#Don't need as haven't carried forward lat/longs for grid, just using OID_
+#Location.list<-c('LATITUDE', 'LONGITUDE')
+
+Big.List<-c(Numeric.list, Categorical.list, Admin.list)
+
+
+#Subset data to the attributes specified above:
+data<-grid_clean[,names(grid_clean) %in% Big.List]
+head(data)
+names(data)
+nrow(data)
+
+```
+
+#### Assign StreamCat attributes to unsampled grid:
+
+```{r}
+
+##ADD IN STREAM CAT VARIABLES 
+streamcat<-read.csv('./StreamCat/StreamCat_merged_data.csv', sep=",", header=TRUE)
+names(streamcat)
+nrow(streamcat)
+ncol(streamcat)
+
+```
+
+```{r}
+#Streamline streamcat attributes to those used in soil P model before merging to grid attributes (for better efficiency)
+
+#Drop some columns to make dataset a little smaller:
+
+#DROP ALL NLCD YEARS EXCEPT 2019
+#For categories that have year 2001, 2004, 2006, 2008, 2011
+
+#Also omit other fire and veg/greenness metrics that weren't used originally
+
+#Note: "PctAg2006Slp10Ws, as 2006 appears to be the only year for which this attribute exists (even tho streamcat variable list says it should exist for multiple NLCD series)
+#So will need to keep that attribute while dropping all other 2006 attributes 
+names(All.att)
+streamcat %>% dplyr::select(PctAg2006Slp10Ws) %>% head()
+
+
+
+All.att <- streamcat %>% 
+  dplyr::select(-contains(c('2001', '2004', '2006', '2011','2013','2016', 'MTBS', 'Burn', 'Fire', 'Mask', 'Greenness', 'FrstLoss')), 'PctAg2006Slp10Ws') 
+
+names(All.att)
+ncol(All.att)
+
+#Check to see if PctAg2006Slp10Ws was maintained:
+All.att %>% dplyr::select(PctAg2006Slp10Ws) %>% head()
+
+
+#Replace 2019 attributes with "2006"
+colnames(All.att) <- gsub("2019", "2006", colnames(All.att))
+
+
+#################################################################
+###EXCLUDE VARIABLES:
+
+#For this dataset, we need the same attributes that were used to build the original soil P model for the UMRB. 
+
+#Load in attribute data for the original soil P model in the UMRB:
+UMRB<-read.delim("./_UMRB_Soil_P_data_for_modelling.txt", sep=",", header=TRUE)
+head(UMRB)
+names(UMRB)
+
+Orig.List<-colnames(UMRB)
+Orig.List
+
+#Find columns missing from streamcat that are in original UMRB dataset:
+Orig.List[!Orig.List %in% colnames(All.att)]
+
+#Missing columns (besides ssurgo and columns I processed above):
+
+#Temperature and Precip columns appear to have been updated since UMRB model was built
+#Based on the streamcat variable list, "Precip8110" are the 30 year average values 1981-2010, Precip9120 are 30 year average balues 1991-2020
+
+#In previous model, used mean values from 2008
+#used 30 year averages from 1981-2010
+
+#For this model, use mean values from 2008
+#Use 30 year averages from 1981-2010
+
+All.att %>% 
+  dplyr::select(contains(c("Precip","Tmean","Tmax","Tmin"))) %>% names()
+
+#Create CatPctFull and WsPctFull columns (these typically don't contain useful information anyway)
+
+
+#check for dpulicate COMIDs?
+nrow(All.att)
+All.att %>% dplyr::select(COMID) %>% distinct() %>% count()
+
+#Check duplicates
+View(All.att %>% group_by(COMID) %>% 
+  filter(n()>1))
+
+
+#Correct columns: 
+#remove duplicate COMIDs
+
+All.Att.cor<-All.att %>% 
+  mutate(CatPctFull=100) %>% 
+  mutate(WsPctFull=100) %>% 
+  rename(PrecipCat=Precip08Cat) %>% 
+  rename(PrecipWs=Precip08Ws) %>% 
+  rename(TmaxCat=Tmax8110Cat) %>%
+  rename(TminCat=Tmin8110Cat) %>% 
+  rename(TmeanCat=Tmean08Cat) %>% 
+  rename(TmaxWs=Tmax8110Ws) %>% 
+  rename(TminWs=Tmin8110Ws) %>% 
+  rename(TmeanWs=Tmean08Ws) %>% 
+  distinct()
+
+names(All.Att.cor)
+nrow(All.Att.cor)
+
+#Check again for remaining duplicate COMIDs
+ncol(All.Att.cor)
+View(All.Att.cor %>% group_by(COMID) %>% 
+  filter(n()>1))
+All.Att.cor %>% group_by(COMID) %>% filter(n()>1) %>%  dplyr::select(491:540) |> View()
+
+
+#still a few duplicates?
+
+#are any values different for a given COMID?
+#(note: aborted this as it took forever to run)
+result <- All.Att.cor %>%
+  group_by(COMID) %>%
+  summarise(across(everything(), ~ length(unique(.)) > 1)) %>%
+  pivot_longer(-COMID, names_to = "Column", values_to = "Differs") %>%
+  filter(Differs == TRUE)
+result
+
+#If not different, just take first row for each COMID
+All.Att.cor.unique<-All.Att.cor %>%
+  group_by(COMID) %>%
+  filter(row_number()==1)
+nrow(All.Att.cor.unique) 
+#Ok now all duplicates omitted
+
+Orig.List[!Orig.List %in% colnames(All.Att.cor)]
+
+#MERGE STREAMCAT TO ALL SOIL P DATA
+start.time<-Sys.time()
+start.time
+
+#check for NAs in COMID
+View(data %>% filter(is.na(COMID)))
+#are some COMIDs - are these outside state of MS?
+
+#plot example grid points with NA for COMID
+
+#Map grid points with mukey info missing:
+tmap_mode("view")
+tm_shape(MS_sf)+
+  tm_borders(col="purple", lwd=0.5)+
+tm_shape(HUC4_contig)+
+ tm_borders(col="blue")+
+tm_shape(grid_spatial %>% filter(OID_=="3502"))+
+  tm_dots()
+
+#Ok! Point is inside MS, but outside the two HUC4s of interest -- So will lose some additional sites because of no NA for COMID
+data %>% filter(is.na(COMID)) %>% nrow()
+
+All.grid.Att<-merge(data, All.Att.cor.unique, by=c('COMID')) 
+
+end.time<-Sys.time()
+total.time<-end.time-start.time
+total.time 
+
+
+head(All.grid.Att)
+nrow(All.grid.Att)
+
+#Check for duplicates
+nrow(All.grid.Att %>% distinct())
+
+#1733657
+
+#Select only columns that were in original Soil P UMRB dataset:
+#remove duplicates
+names(All.grid.Att)
+All.grid.select<-All.grid.Att %>%
+  dplyr::select(OID_|any_of(Orig.List))
+
+nrow(All.grid.select)
+#names(All.grid.select)
+
+#Check that number of attributes match
+
+length(Orig.List) #note that this inlcudes P_mgkg, not yet in grid dataset
+ncol(All.grid.select) #note that this includes OID_, not in original dataset
+
+#write to file
+#write.csv(All.grid.select, "./grid_MS_Delta_all_attributes.csv")
+
+
+
+
+
+```
+
+#### Do final formatting of grid data and impute missing values:
+
+```{r}
+
+names(All.grid.select)
+
+#Exclude open water
+All.grid.select %>% filter(NLCD06Cat=="Open Water") %>% count()
+#n=22964
+
+grid.nowater<-All.grid.select %>% filter(!NLCD06Cat=="Open Water")
+nrow(grid.nowater)
+
+
+#Transform attributes to correct class as a check on attributes present
+#format covariates to correct class:
+P.Predictors <- transform(
+  grid.nowater,
+  slope_r=as.numeric(slope_r),
+  elev_r=as.numeric(elev_r),
+  airtempa_r=as.numeric(airtempa_r),
+  ffd_r=as.numeric(ffd_r),
+  comppct_r=as.numeric(comppct_r),
+  soc150_999=as.numeric(soc150_999),
+  sieveno4_r=as.numeric(sieveno4_r),
+  sieveno10_r=as.numeric(sieveno10_r),
+  sieveno40_r=as.numeric(sieveno40_r),
+  sieveno200_r=as.numeric(sieveno200_r),
+  sandtotal_r=as.numeric(sandtotal_r),
+  silttotal_r=as.numeric(silttotal_r),
+  claytotal_r=as.numeric(claytotal_r),
+  om_r=as.numeric(om_r),
+  ksat_r=as.numeric(ksat_r),
+  kffact=as.numeric(kffact),
+  caco3_r=as.numeric(caco3_r),
+  gypsum_r=as.numeric(gypsum_r),
+  aws0_5 = as.numeric(aws0_5), 
+  aws5_20=as.numeric(aws5_20),
+  aws20_50= as.numeric(aws20_50), 
+  aws50_100=as.numeric(aws50_100), 
+  aws100_150=as.numeric(aws100_150), 
+  aws0_20=as.numeric(aws0_20),
+  aws0_30=as.numeric(aws0_30),
+  aws0_100=as.numeric(aws0_100), 
+  aws0_150=as.numeric(aws0_150) , 
+  aws0_999=as.numeric(aws0_999), 
+  soc0_5=as.numeric(soc0_5), 
+  soc5_20=as.numeric(soc5_20),
+  soc20_50=as.numeric(soc20_50), 
+  soc50_100=as.numeric(soc50_100),
+  soc100_150=as.numeric(soc100_150), 
+  soc0_20=as.numeric(soc0_20), 
+  soc0_30=as.numeric(soc0_30),
+  soc0_100=as.numeric(soc0_100), 
+  soc0_150=as.numeric(soc0_150),
+  soc0_999=as.numeric(soc0_999), 
+  nccpi3corn=as.numeric(nccpi3corn),
+  nccpi3soy=as.numeric(nccpi3soy), 
+  nccpi3cot=as.numeric(nccpi3cot),
+  nccpi3sg=as.numeric(nccpi3sg), 
+  nccpi3all=as.numeric(nccpi3all),
+  pctearthmc=as.numeric(pctearthmc), 
+  rootznemc=as.numeric(rootznemc),
+  rootznaws=as.numeric(rootznaws), 
+  droughty=as.numeric(droughty),
+  Depth_cm=as.numeric(Depth_cm),
+  PctNonCarbResidCat=as.numeric(PctNonCarbResidCat)
+)
+
+
+#transform categorical variables
+P.Predictors <- transform(
+  P.Predictors,
+  StreamType=as.factor(StreamType),
+  WetlandType=as.factor(WetlandType),
+  NLCD06Cat=as.factor(NLCD06Cat),
+  hydricrating=as.factor(hydricrating),
+  drainagecl=as.factor(drainagecl),
+  taxpartsize=as.factor(taxpartsize),
+  taxceactcl=as.factor(taxceactcl),
+  taxreaction=as.factor(taxreaction),
+  texcl=as.factor(texcl),
+  pmkind=as.factor(pmkind)
+)
+
+#Transform all remaining integer attributes to numeric:
+P.Predictors <- P.Predictors %>%
+  mutate(across(where(is.integer), as.numeric))
+
+#Check class of all attributes
+lapply(P.Predictors, class)
+
+
+#Impute missing values
+#using na.roughfix option below
+library(randomForest)
+
+start.time<-Sys.time()
+start.time
+
+grid.roughfix<-na.roughfix(P.Predictors)
+head(grid.roughfix)
+
+end.time<-Sys.time()
+end.time-start.time
+
+#Make an empty P_mgkg column?
+grid.roughfix$P_mgkg<-as.numeric(rep("0", nrow(grid.roughfix)))
+#head(grid.roughfix)
+
+
+
+#write to file
+start.time<-Sys.time()
+start.time
+
+fwrite(grid.roughfix, './grid_MS_Delta_all_attributes_imputed.csv', sep=",", row.names=FALSE)
+
+end.time<-Sys.time
+end.time-start.time
+end.time
+
+```
