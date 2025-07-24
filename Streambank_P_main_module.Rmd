@@ -24,7 +24,7 @@ rm(list=ls())
 #Load or install packages if necessary
 
 #list of necessary packages 
-want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest')
+want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr')
 
 
 need <- want[!(want %in% installed.packages()[,"Package"])]
@@ -32,16 +32,22 @@ if (length(need)) install.packages(need)
 lapply(want, function(i) require(i, character.only=TRUE))
 rm(want, need)
 
-#Create subdirectory shortcuts
+
+
+# Create subdirectory shortcuts
 
 dir.root<-getwd()
 
 dir.data<-paste(dir.root, "/Streambank_P_measured_data", sep="")
 
-#Create output folder destinations, if they don't already exist:
-dir.create(file.path(getwd(), "Spatial_data"))
-
 dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
+
+
+# Create additional folder destinations, if they don't already exist:
+dir.create(file.path(getwd(), "Spatial_data"))
+dir.create(file.path(dir.spatial, "nlcd"))
+dir.create(file.path(dir.spatial,"ssurgo"))
+
 
 ```
 
@@ -51,15 +57,17 @@ dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
 
 ## Data sources
 
-1.  **Keith Schilling et al dataset for Iowa streams, documented here:** <https://www.jswconline.org/content/77/2/103>.
+1.  **Keith Schilling et al dataset for Iowa streams, documented here:**
 
-Note: I made minor modifications to the original data file they sent me on 1/10/2022
+    <https://www.tandfonline.com/doi/full/10.2489/jswc.2022.00036>
+
+    Note: I made minor modifications to the original data file they sent me on 1/10/2022
 
 -   simplified site IDs (column 'Site') and replicates, which were previously in one column called 'subsample ID'
 
 Notes on methods for this dataset:
 
-Stream bank samples were collected from across the state, from stream orders 1-6 (n=148 total samples) with all 8 Major Land Resource Areas in Iowa. Multiple samples (up to 3) were collected from each streambank if alluvial members could be differentiated, otherwise a single mid-bank sample was collected. No depth measure is given for replicates.
+Stream bank samples were collected from across the state, from stream orders 1-6 (n=148 total samples) with all 8 Major Land Resource Areas in Iowa. Multiple samples (up to 3) were collected from each streambank if alluvial members could be differentiated, otherwise a single mid-bank sample was collected. No depth measure is given for replicates. No date is given for sample collection, in dataset or in paper.
 
 -   for their purposes, they averaged streambank TP values = 470 mg/kg
 
