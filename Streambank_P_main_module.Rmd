@@ -24,7 +24,8 @@ rm(list=ls())
 #Load or install packages if necessary
 
 #list of necessary packages 
-want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp')
+want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest')
+
 
 need <- want[!(want %in% installed.packages()[,"Package"])]
 if (length(need)) install.packages(need)
@@ -86,9 +87,9 @@ Stream bank samples were collected from across the state, from stream orders 1-6
 list.files(dir.data)
 
 #Load in data files (separately or all at once):
-measP<-read_excel(paste(dir.data, "/Schilling_et_al_soil_P_data_MODIFIED_CLD.xlsx",sep=""))
+samples<-read_excel(paste(dir.data, "/Schilling_et_al_soil_P_data_MODIFIED_CLD.xlsx",sep=""))
 
-head(measP)
+head(samples)
 
 ```
 
@@ -104,24 +105,26 @@ Question about other potential measured attributes - these could be useful later
 
 #Select and rename needed columns
 
-names(measP)
+names(samples)
 
-measP.clean<-measP %>% 
+samples.clean<-samples %>% 
   dplyr::select('Site','replicates', 'X', 'Y', 'P (mg/kg)', 'BD (g/cm^3)') %>% 
   rename(Lat=Y, Long=X, P_mgkg= 'P (mg/kg)', BD_gcm3='BD (g/cm^3)') %>% 
     mutate(dataset="Schilling_IA") %>% 
   na.omit()#drop samples with no coordinates
 
-nrow(measP.clean)
+nrow(samples.clean)
 ```
 
-Get area of interest and plot a quick map of streambank P data
+### Get area of interest and plot a quick map of streambank P data
+
+i.e., areas intersecting sampled points
 
 ```{r}
-names(measP.clean)
+names(samples.clean)
 
 #Convert streambank P locations to spatial object:
-measP_sf<-st_as_sf(measP.clean, coords=c("Long","Lat"), crs=4269)
+loc_sf<-st_as_sf(samples.clean, coords=c("Long","Lat"), crs=4269)
 
 
 #For area of interest, select states that overlap with measured P data
@@ -134,9 +137,9 @@ states_sf
 st_crs(states_sf) #check reference system
 
 
-#ID states that intersect with measured data
+#ID states that intersect with measured data (Area of Interest)
 
-States_sub <- states_sf[measP_sf, ]
+States_sub <- states_sf[loc_sf, ]
 
 #Quick plot of states
 plot(States_sub$geometry, col=alpha("blue",0.3))
@@ -144,13 +147,156 @@ plot(States_sub$geometry, col=alpha("blue",0.3))
 
 
 #Quick plot of streambank P locations and states
-library(grDevices)
 
-tm_mode("view")
+#for interactive viewing:
+#tmap_mode("view")
 
 tm_shape(States_sub)+
   tm_borders()+
-tm_shape(measP_sf)+
+tm_shape(loc_sf)+
   tm_symbols(fill="P_mgkg", size=0.5, fill.scale=tm_scale(values = rev(hcl.colors(4, "SunsetDark"))))
 
 ```
+
+### Get hydrologic area of interest
+
+```{r}
+
+#Dissolve the boundaries between states to create a single contiguous polygon for the area of interest (AOI)
+States_AOI <- st_union(States_sub)
+
+plot(States_AOI)
+
+
+#Pull in HUC4 boundaries using nhdplusTools
+HUC4<-get_huc(AOI = States_AOI, type = "huc04")
+st_crs(HUC4) #check reference system
+names(HUC4)
+
+#plot locations of sample sites, states, and HUC4 boundaries
+
+tmap_mode("plot")
+
+tm_shape(HUC4)+
+  tm_borders(col="blue")+
+  tm_text("name", size = 0.5, col = "black", just = "center")+
+tm_shape(States_sub) +
+  tm_borders()+
+tm_shape(loc_sf)+
+  tm_dots()
+
+
+
+```
+
+## Further subset study area:
+
+To speed up geoprocessing, can subset area even smaller - ID relevant HUC4 or HUC8s that samples are located in
+
+```{r}
+#Create shapefile for HUC4s that encompass sample locations 
+
+HUC4_subset<-HUC4[loc_sf,] 
+
+#Plot
+tm_shape(HUC4_subset)+   
+  tm_borders(col="blue")+   
+tm_shape(loc_sf)+   
+  tm_dots()
+```
+
+Dissolve HUC4 boundaries to create a hydrologic AOI:
+
+```{r}
+
+HUC4_AOI <- st_union(HUC4_subset)
+
+plot(HUC4_AOI)
+
+```
+
+# 
+
+# Predict streambank TP from spatial attributes 
+
+Some soil properties (SSURGO supplemented with STATSGO) have already aggregated at the 800m grid scale by this resource:
+
+Citation: Walkinshaw, Mike, A.T. O'Geen, D.E. Beaudette. "Soil Properties." California Soil Resource Lab, 1 Oct. 2023, casoilresource.lawr.ucdavis.edu/soil-properties/.
+
+<https://casoilresource.lawr.ucdavis.edu/soil-properties/download.php>
+
+Other potential attributes of interest
+
+-stream order, stream type
+
+-land use
+
+-other SSURGO attributes?
+
+-Justification for approach - ppl are increasingly wanting to know streambank TP content because of management approaches (ie, P banking)
+
+-but b/c of specific dynamics of rivers (alluvial deposition etc), banks might be idiosyncratic
+
+**Ideas for approach:**
+
+-use already aggregated attributes by ca soil lab
+
+-use same method you used before for soil TP
+
+\-'ppl don't really use vanilla RF any more'
+
+-better to do initial variable selection
+
+\-(essentially improve the method you used before, using xgboost and variable selection)
+
+-probably without depth measurement
+
+-main reason to reduce features is to reduce compute time - eliminate/combine multicollinear features
+
+some useful stuff here: <https://www.reddit.com/r/MachineLearning/comments/1jz8boa/d_advice_on_building_random_forestxgboost_model/>
+
+-random search or bayesian optimization to tune
+
+-try multiple modeling approaches
+
+-One approach described in the link above:
+
+Recently went through something similar to this (though, not as many features - only 233). The approach that I took was -
+
+\* Ran 4 separate models (XGB, LightGBM, RF and ExtraTreesRegressor)\
+\* Extra trees gave best results and thus was selected
+
+\* Used Recursive Feature Elimination (RFE) to shortlist 60 best features
+
+\* Ran Optuna on the 60 to get best hyper parameters
+
+\* Fit ExtraTrees with tuned hyps to get the final model
+
+This worked quite well and was able to see about 3+% points improvements after Optuna.
+
+I'd suggest Optuna instead of GridSearchCV because -
+
+\* Optuna uses bayesian methods to select hyps and on subsequent runs you can expand/contract the hyp ranges to where it performs best
+
+\* Optuna process includes CV
+
+\* Lots of good graphs to help you tune better.
+
+## Join attributes to sample locations
+
+use model assign attributes - adapt this script to be more generalizable
+
+```{r}
+source(module_assign_attributes.Rmd)
+```
+
+# Match measured streambank TP values to SSURGO TP values (where they exist)
+
+# Remove temporary files
+
+```{r}
+
+file.remove(list.files(tempwd, full.names = T)) #remove all files from our temp folder
+```
+
+# 
