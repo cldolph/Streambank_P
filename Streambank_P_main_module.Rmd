@@ -21,10 +21,10 @@ knitr::opts_chunk$set(echo = TRUE)
 rm(list=ls())
 
 
-#Load or install packages if necessary
+#install and load packages
 
 #list of necessary packages 
-want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr')
+want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools')
 
 
 need <- want[!(want %in% installed.packages()[,"Package"])]
@@ -33,20 +33,39 @@ lapply(want, function(i) require(i, character.only=TRUE))
 rm(want, need)
 
 
+#Install StreamCatTools (if not already installed):
+# First install remotes if needed
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+# Install StreamCatTools
+if (!requireNamespace("StreamCatTools", quietly = TRUE)) {
+  remotes::install_github("USEPA/StreamCatTools")
+}
+# Load the package
+library(StreamCatTools)
+
+
 
 # Create subdirectory shortcuts
 
+#Main directory
 dir.root<-getwd()
 
+#Input data
 dir.data<-paste(dir.root, "/Streambank_P_measured_data", sep="")
 
+#Spatial data
 dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
 
+#Output data (produced by script)
+dir.output<-paste0(dir.root, "/output_data")
 
 # Create additional folder destinations, if they don't already exist:
 dir.create(file.path(getwd(), "Spatial_data"))
 dir.create(file.path(dir.spatial, "nlcd"))
 dir.create(file.path(dir.spatial,"ssurgo"))
+dir.create(file.path(dir.root,"output_data"))
 
 
 ```
@@ -117,7 +136,7 @@ names(samples)
 
 samples.clean<-samples %>% 
   dplyr::select('Site','replicates', 'X', 'Y', 'P (mg/kg)', 'BD (g/cm^3)') %>% 
-  rename(Lat=Y, Long=X, P_mgkg= 'P (mg/kg)', BD_gcm3='BD (g/cm^3)') %>% 
+  dplyr::rename(Lat='Y', Long='X', P_mgkg= 'P (mg/kg)', BD_gcm3='BD (g/cm^3)') %>% 
     mutate(dataset="Schilling_IA") %>% 
   na.omit()#drop samples with no coordinates
 
@@ -133,6 +152,10 @@ names(samples.clean)
 
 #Convert streambank P locations to spatial object:
 loc_sf<-st_as_sf(samples.clean, coords=c("Long","Lat"), crs=4269)
+
+#Retain lat/long as attribute columns
+loc_sf<-loc_sf %>% 
+mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2])
 
 
 #For area of interest, select states that overlap with measured P data
@@ -225,7 +248,7 @@ plot(HUC4_AOI)
 
 # 
 
-# Predict streambank TP from spatial attributes 
+# Predict streambank TP from spatial attributes
 
 Some soil properties (SSURGO supplemented with STATSGO) have already aggregated at the 800m grid scale by this resource:
 
@@ -294,8 +317,10 @@ I'd suggest Optuna instead of GridSearchCV because -
 
 use model assign attributes - adapt this script to be more generalizable
 
+NOTE 8.4.25 - RUNNING THIS AS SOURCE CODE ISN"T WORKING SO FAR, CAN JUST KEEP IT IN MAIN SCRIPT?
+
 ```{r}
-source(module_assign_attributes.Rmd)
+#source(module_assign_attributes.Rmd)
 ```
 
 # Match measured streambank TP values to SSURGO TP values (where they exist)
@@ -304,7 +329,7 @@ source(module_assign_attributes.Rmd)
 
 ```{r}
 
-file.remove(list.files(tempwd, full.names = T)) #remove all files from our temp folder
+#file.remove(list.files(tempwd, full.names = T)) #remove all files from our temp folder
 ```
 
 # 
