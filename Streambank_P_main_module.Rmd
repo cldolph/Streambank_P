@@ -24,7 +24,7 @@ rm(list=ls())
 #install and load packages
 
 #list of necessary packages 
-want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools')
+want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools', 'pbapply', 'digest')
 
 
 need <- want[!(want %in% installed.packages()[,"Package"])]
@@ -61,11 +61,14 @@ dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
 #Output data (produced by script)
 dir.output<-paste0(dir.root, "/output_data")
 
+dir.figures<-paste0(dir.root, '/Maps_figures')
+
 # Create additional folder destinations, if they don't already exist:
 dir.create(file.path(getwd(), "Spatial_data"))
 dir.create(file.path(dir.spatial, "nlcd"))
 dir.create(file.path(dir.spatial,"ssurgo"))
 dir.create(file.path(dir.root,"output_data"))
+dir.create(file.path(dir.root, "Maps_figures"))
 
 
 ```
@@ -74,11 +77,9 @@ dir.create(file.path(dir.root,"output_data"))
 
 # Measured Streambank P data
 
-## Data sources
+## **Keith Schilling et al dataset for Iowa streams, documented here:**
 
-1.  **Keith Schilling et al dataset for Iowa streams, documented here:**
-
-    <https://www.tandfonline.com/doi/full/10.2489/jswc.2022.00036>
+1.  <https://www.tandfonline.com/doi/full/10.2489/jswc.2022.00036>
 
     Note: I made minor modifications to the original data file they sent me on 1/10/2022
 
@@ -106,7 +107,7 @@ Stream bank samples were collected from across the state, from stream orders 1-6
 
 -   Among riparian soils, TP concentrations were observed to range from 109 to 1,569 mg kg--1 and average 470 ± 192 mg kg--1 ([**figure 5**](https://www.jswconline.org/content/77/2/103#F5)). Although minor differences were observed among various MLRAs or stream order classifications, the variability was mainly associated with an occasional low or high value not representative of the entire sample population. Bulk density of exposed streambank soils averaged 1.17 ± 0.14 g cm--3.
 
-## Load measured streambank P data
+**Load measured streambank P data**
 
 ```{r}
 
@@ -120,7 +121,7 @@ head(samples)
 
 ```
 
-### Preprocess data from different sources to have matching format
+**Preprocess data from different sources to have matching format**
 
 Main columns needed:
 
@@ -136,14 +137,95 @@ names(samples)
 
 samples.clean<-samples %>% 
   dplyr::select('Site','replicates', 'X', 'Y', 'P (mg/kg)', 'BD (g/cm^3)') %>% 
-  dplyr::rename(Lat='Y', Long='X', P_mgkg= 'P (mg/kg)', BD_gcm3='BD (g/cm^3)') %>% 
+  dplyr::rename(y='Y', x='X', P_mgkg= 'P (mg/kg)', BD_gcm3='BD (g/cm^3)') %>% 
     mutate(dataset="Schilling_IA") %>% 
   na.omit()#drop samples with no coordinates
 
 nrow(samples.clean)
 ```
 
-### Get area of interest and plot a quick map of streambank P data
+## **Soil P samples from USGS and USDA (previously used to build soil P model)**
+
+Already has: NLCD, NWI, MUKEY, FEATUREID - so can skip ahead in module to assign attributes to: "Add additional StreamCat and SSURGO attributes based on unique IDs (COMID and MUKEY)"\
+Note 1: NLCD is coded by \# not text class
+
+Note 2: I have converted feature ID to COMID, but note some differences: Feature ID vs COMID:
+
+In the National Hydrography Dataset (NHD) and NHDPlus, both **FeatureID** and **COMID** serve as identifiers, but they are used for different features:. 
+
+-   **COMID (Component ID):** This is a unique identifier primarily associated with the **NHDFlowline** features in the NHDPlusV2 data. An NHDFlowline represents a segment of a river, stream, or other linear water feature. Essentially, every stream segment has a unique COMID. The COMID can also be used as an identifier for the catchment polygon and value-added attributes that describe characteristics of the catchment's interior.
+
+-   **FeatureID:** This identifier is used for the **catchment** features in the NHDPlusV2 dataset, which are polygons representing the drainage area contributing to a specific flowline. A positive FeatureID always matches the COMID of the associated flowline, indicating the catchment drains into that particular flowline. A negative FeatureID, on the other hand, indicates a sink, a catchment without an associated flowline, implying it's an internal drainage basin or a closed lake
+
+Data processing based on module 4 in <https://github.com/cldolph/SoilP/tree/main/Soil_P_input>
+
+```{r}
+#option to skip if not using this dataset
+#{r, load in soil database, eva=FALSE}
+
+#Read in USGS and USDA NCSS data and clean up 
+
+usgs<-read.csv(paste0(dir.data, '/USGS_alldepths_soil_since2000_region_NWI_NHDv2100_NLCD06_ssurgo_catchment.csv'))
+ncss<-read.csv(paste0(dir.data, '/NCSS_alldepths_MajorElements_since2000_region_NLCD06_NHDv2100_NWI_ssurgo_catchment.csv'))
+
+names(usgs)
+nrow(usgs)
+names(ncss)
+nrow(ncss)
+
+soilP_database<-rbind(
+  
+usgs %>% 
+  dplyr::select(LATITUDE, LONGITUDE, P_mgkg, max_depth_est, NLCD06, MUTKEY, FEATUREID, ATTRIBUTE, WETLAND_TYPE, COLL_DATE) %>% 
+  dplyr::rename(Date=COLL_DATE, x=LONGITUDE, y=LATITUDE) %>% 
+  mutate(Depth_cm=max_depth_est*2.54) %>% #convert depth to cm
+  dplyr::select(-max_depth_est), #drop old depth est
+                  
+ncss %>% 
+  dplyr::select(latitude_decimal_degrees, longitude_decimal_degrees, p_mjelm, hzn_bot, NLCD06, MUTKEY, FEATUREID, ATTRIBUTE, WETLAND_TYPE, Date) 
+%>% 
+  dplyr::rename(y=latitude_decimal_degrees, x=longitude_decimal_degrees, P_mgkg=p_mjelm, Depth_cm=hzn_bot)
+)
+  
+names(soilP_database)
+nrow(soilP_database)
+
+
+#Process column names
+samples.clean<-soilP_database %>%
+  dplyr::rename(comid=FEATUREID, MUKEY=MUTKEY, NLCD_Land=NLCD06) %>% 
+  dplyr::select('x', 'y', 'P_mgkg', 'Depth_cm', 'NLCD_Land', 'MUKEY','comid', 'ATTRIBUTE', 'WETLAND_TYPE') %>% 
+  mutate(dataset="USGS_USDA") %>%
+  na.omit() %>% #remove NAs
+  mutate(comid=ifelse(comid<1, comid*-1, comid)) %>%  #make all comid values positive (see note above)
+  dplyr::mutate(SampleID=row_number())#Create sample ID
+
+head(samples.clean)   
+
+#OPTION: Pick top depth for each location (if don't retain depth as an attribute)
+#samples.clean<-samples.clean %>% 
+# group_by(x, y) %>% 
+#    dplyr::slice(which.min(Depth_cm))
+#names(samples.clean)
+#nrow(samples.clean)
+
+#View(samples.clean)
+
+#write to file
+write.csv(samples.clean, paste0(dir.output, "/USGS_NCSS_soils_database_attributes_alldepths.csv"))
+```
+
+Plot TP by depth (if applicable)
+
+```{r}
+names(samples.clean)  
+
+ggplot(samples.clean)+   geom_point(aes(Depth_cm, P_mgkg))
+```
+
+## 
+
+# Get area of interest and plot a quick map of streambank P data
 
 i.e., areas intersecting sampled points
 
@@ -151,7 +233,7 @@ i.e., areas intersecting sampled points
 names(samples.clean)
 
 #Convert streambank P locations to spatial object:
-loc_sf<-st_as_sf(samples.clean, coords=c("Long","Lat"), crs=4269)
+loc_sf<-st_as_sf(samples.clean, coords=c("x","y"), crs=4269)
 
 #Retain lat/long as attribute columns
 loc_sf<-loc_sf %>% 
@@ -180,24 +262,32 @@ plot(States_sub$geometry, col=alpha("blue",0.3))
 #Quick plot of streambank P locations and states
 
 #for interactive viewing:
-#tmap_mode("view")
+tmap_mode("plot")
 
-tm_shape(States_sub)+
+Sites.map<-tm_shape(States_sub)+
   tm_borders()+
 tm_shape(loc_sf)+
-  tm_symbols(fill="P_mgkg", size=0.5, fill.scale=tm_scale(values = rev(hcl.colors(4, "SunsetDark"))))
+  tm_symbols(fill="P_mgkg", shape=19, size=0.3, fill.scale=tm_scale(values = rev(hcl.colors(4, "SunsetDark"))))+
+  tm_basemap(server="Esri.WorldGrayCanvas")
+Sites.map
+
+tmap_save(Sites.map, filename=paste0(dir.figures, "/Sites_map.jpg"), dpi=300)
+
 
 ```
 
-### Get hydrologic area of interest
+## Area of interest by state
 
 ```{r}
-
 #Dissolve the boundaries between states to create a single contiguous polygon for the area of interest (AOI)
 States_AOI <- st_union(States_sub)
 
 plot(States_AOI)
+```
 
+## Get hydrologic area of interest
+
+```{r}
 
 #Pull in HUC4 boundaries using nhdplusTools
 HUC4<-get_huc(AOI = States_AOI, type = "huc04")
@@ -245,8 +335,6 @@ HUC4_AOI <- st_union(HUC4_subset)
 plot(HUC4_AOI)
 
 ```
-
-# 
 
 # Predict streambank TP from spatial attributes
 
@@ -331,5 +419,3 @@ NOTE 8.4.25 - RUNNING THIS AS SOURCE CODE ISN"T WORKING SO FAR, CAN JUST KEEP IT
 
 #file.remove(list.files(tempwd, full.names = T)) #remove all files from our temp folder
 ```
-
-# 
