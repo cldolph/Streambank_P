@@ -10,7 +10,21 @@ Contact: dolph008\@umn.edu
 
 This repository provides data and R Markdown scripts used in the preparation of Dolph et al., (in review), *"Streambanks are not like other soils: predicting streambank phosphorus content using machine learning".* The repository contains some of the input data used in this analysis (see descriptions below; note that some of the input data is also published in an independent location), as well as a set of R Markdown scripts that provide the following: a summary of soil and streambank phosphorus, methods for assigning geospatial attributes to sampled point locations, and methods for tuning Random Forest and XGBoost machine learning models used to predict soil and streambank total phosphorus. These scripts include code used to produce the figures in the manuscript.
 
-# Datasets:
+# Set Up & Installation
+
+1.  Download `~/Streambank_P.zip` to local file system.
+
+2.  Unzip the files to a folder labeled `~/Streambank_P`.
+
+3.  Still in the local file system, open the `Streambank_PRproj` file. This will open the project in RStudio and set the working directory to `~/Streambank_P`.
+
+4.  Run the RMarkdown scripts in numerical order, beginning with `Module1_LoadData.Rmd`. Follow the notes in each script file for detailed instructions.
+
+5.  All file paths within the scripts are relative.
+
+# Datasets
+
+These are found in the "Streambank_P_measured_data" directory.
 
 ## 1) Modern upland soil total phosphorus data
 
