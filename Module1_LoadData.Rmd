@@ -1,0 +1,736 @@
+---
+title: "Module1_LoadData"
+author: "Christy Dolph"
+date: "2026-03-03"
+output: html_document
+highlight: kate
+    pandoc_args: ["--lua-filter=number-lines.lua"] # Optional: for continuous line numbering across chunks
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1 Overview
+
+This script loads, processes and summarizes upland soil and streambank total phosphorus (TP) data. The script also sets the area of interest for module 2, where features (predictors) are assigned to sample locations.
+
+# 2 Workspace Setup
+
+Load packages and set directories.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Clean up workspace 
+rm(list=ls())
+
+
+#install and load packages
+
+#list of necessary packages 
+want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools', 'pbapply', 'digest', 'grid')
+
+
+need <- want[!(want %in% installed.packages()[,"Package"])]
+if (length(need)) install.packages(need)
+lapply(want, function(i) require(i, character.only=TRUE))
+rm(want, need)
+
+
+#Install StreamCatTools (if not already installed):
+# First install remotes if needed
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+# Install StreamCatTools
+if (!requireNamespace("StreamCatTools", quietly = TRUE)) {
+  remotes::install_github("USEPA/StreamCatTools")
+}
+# Load the package
+library(StreamCatTools)
+
+
+
+# Create subdirectory shortcuts
+
+#Main directory
+dir.root<-getwd()
+
+#Input data
+dir.data<-paste(dir.root, "/Streambank_P_measured_data", sep="")
+
+#Spatial data
+dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
+
+#Output data (produced by script)
+dir.output<-paste0(dir.root, "/output_data")
+
+dir.figures<-paste0(dir.root, '/Maps_figures')
+
+# Create additional folder destinations, if they don't already exist:
+dir.create(file.path(getwd(), "Spatial_data"))
+dir.create(file.path(dir.spatial, "nlcd"))
+dir.create(file.path(dir.spatial,"ssurgo"))
+dir.create(file.path(dir.root,"output_data"))
+dir.create(file.path(dir.root, "Maps_figures"))
+
+
+```
+
+# 3 Load and process measured Soil/Streambank TP data
+
+Main columns needed for all datasets: Site ID, replicate ID, lat, long, P_mgkg, bulk density.
+
+## 3.1 Streambank TP data
+
+Measured by Andrew Margenot's group at University of Illinois streambank TP.
+
+Note subsamples collected at different depths at each location
+
+Depth was measured as a range (min and max depth values where sample was collected). Using the max depth estimate is consistent with data processing for the USGS/USDA input data used to build the original soil P model in Dolph et al. 2023.
+
+Streambank samples are clustered around specific stream reaches, rather than spread uniformly across the state
+
+```{r}
+#List all data in data directory:
+list.files(dir.data)
+
+#read in data:
+
+#Streambank P data:
+IL_streambank<-read_excel(paste0(dir.data, '/Margenot streambank soil data to SERA-17_09192025 v2.xlsx'))
+
+#Clean up columns:
+
+IL_streambank_samples.clean<- IL_streambank %>% 
+  separate_wider_delim(cols = 'Depth Range (cm)', delim = "-", names = c("Depth_min_cm", "Depth_max_cm"),cols_remove = FALSE, too_few="debug") %>% 
+  dplyr::select('Lat','Long', 'TP (mg/kg)', 'Bulk Density (g/cm3)', 'Depth_max_cm') %>% 
+  dplyr::rename(y='Lat', x='Long',P_mgkg= 'TP (mg/kg)', BD_gcm3='Bulk Density (g/cm3)', Depth_cm='Depth_max_cm') %>% 
+    mutate(dataset="Margenot_IL") %>% 
+  na.omit() %>% #drop samples with missing data
+  dplyr::mutate(SampleID=row_number())#Create sample ID
+
+
+#Count number of unique sites:
+IL_streambank_samples.clean %>% dplyr::select(y,x) %>% distinct() %>% count() %>% nrow()
+
+#358 streambank P locations 
+
+```
+
+## 3.2 Historic upland soil phosphorus data
+
+Historic soil samples pedons collected 1925-1976 by the Illinois Soil Survey.
+
+Note2: there is a subset of 226 samples in the historic data that are missing lat/longs
+
+```{r}
+
+#Load historic soil pedon data:
+historic.samples<-read_excel(paste0(dir.data, '/Archive&Resample compiled TP&BD_pedons (non-streambank) for Christy.xlsx'))
+  
+#Format Year column and Create unique site ID for specific locations
+#(note multiple horizons sampled at each location)
+historic.samples<-historic.samples %>% 
+  mutate(year=`Year Collected`) %>% 
+  group_by(Latitude, Longitude) %>% #create SiteID
+  dplyr::mutate(SiteID = cur_group_id()) %>%
+  ungroup()
+
+historic.sites.only<-historic.samples %>% 
+  dplyr::select(SiteID, year) %>% 
+  distinct()
+
+#Number of unique sites sampled: 
+
+historic.sites.only %>% 
+  dplyr::select(SiteID) %>% 
+  distinct() %>% nrow()
+
+#Make 'clean' dataset to match with other datasets
+#Rename columns
+#Create a single depth value - choose bottom of depth range - note this will flag issues where depth format is not consistent 
+#exclude values without depth measures (small # of samples)
+#Select needed columns
+#drop samples with no coordinates
+
+
+historic.samples.clean<-historic.samples %>% 
+  dplyr::rename(y='Latitude', x='Longitude',P_mgkg= 'Total P  (mg/kg)', BD_gcm3='Bulk density', Depth_cm='Hzn_bottom (cm)', SampleID='Sample ID') %>% 
+    mutate(dataset="Margenot_IL_pedon") %>% 
+  dplyr::select(SampleID, P_mgkg, x, y, Depth_cm, BD_gcm3) %>%
+  filter(!is.na(as.numeric(x))) #drop samples with missing data
+
+nrow(historic.samples)
+nrow(historic.samples.clean) #check how many NA rows dropped 
+
+
+#Number of unique sites:
+historic.samples.clean %>% dplyr::select(y,x) %>% distinct() %>% nrow()
+#132 sites 
+
+```
+
+### i. Manuscript Plot: \# of historic samples collected by year
+
+```{r}
+
+#Year range sampled: 
+historic.sites.only %>% 
+  summarise(min.year=min(year), max.year=max(year), mean.year=mean(year))
+
+#Plot of samples collected by year
+Date.hist<-ggplot(historic.sites.only)+
+  geom_histogram(aes(year), binwidth=1)+
+  ylab("Number of unique sites sampled")+
+  xlab("Year")+
+  theme_bw()+
+  #xlim(1920,1980)
+  ylim(0, 20)+
+  theme(axis.title = element_text(size = 18), # X-axis title
+    axis.text = element_text(size = 16) # Y-axis text
+  )
+Date.hist
+
+#Save figure to file
+
+png(paste0(file.name=dir.figures, "/Fig_historic_pedons_dates.png"), width = 3000, height = 2400, res = 300)    
+
+grid.newpage() 
+print(Date.hist)
+
+dev.off()  
+```
+
+### ii. Manuscript Plot: Changes in historic soil TP, pre and post 1950)
+
+```{r}
+
+names(historic.samples)
+
+#Group samples pre and post 1950:
+historic.YEAR<-historic.samples %>% 
+  dplyr::rename(P_mgkg='Total P  (mg/kg)', Depth_cm='Hzn_bottom (cm)') %>% 
+  mutate(TimeCat=ifelse(year<1950, "pre-1950", "post-1950")) %>% 
+  mutate(as.factor(TimeCat))
+
+#Check mean P by time period
+historic.YEAR %>% 
+  group_by(factor(TimeCat)) %>% 
+  dplyr::summarize(meanP=mean(P_mgkg))
+
+
+plot.1950<-
+  ggplot(historic.YEAR)+   
+  geom_point(aes(Depth_cm, P_mgkg))+
+  facet_wrap(~TimeCat, ncol=2)+
+  xlab("Soil Depth (cm)")+
+  ylab(bquote(Total~P~(mg~kg^-1)))+
+  theme(strip.text=element_text(size=18), axis.title = element_text(size = 18), # X-axis title
+    axis.text = element_text(size = 16) # Y-axis text
+  )
+plot.1950
+
+#save figure to file
+
+png(paste0(file.name=dir.figures, "/Fig_historic_pedons_P_prepost_1950.png"), width = 8, height = 4, units="in", res = 300)    
+
+grid.newpage() 
+print(plot.1950)
+
+dev.off()  
+
+```
+
+## 3.3 USGS/USDA data (previously used to build soil P model)
+
+***Note 1: This dataset already has attributes assigned from: NLCD, NWI, SSURGO (MUKEY), NHD (FEATUREID). This was work completed in Dolph et al. 2023 . So for this dataset, can skip ahead in Module 2 to section: "Add additional StreamCat and SSURGO attributes based on unique IDs (COMID and MUKEY)"***
+
+Note 2: NLCD is coded by \# not text class
+
+Note 3: I have converted feature ID to COMID, but note some differences: Feature ID vs COMID:
+
+In the National Hydrography Dataset (NHD) and NHDPlus, both **FeatureID** and **COMID** serve as identifiers, but they are used for different features:. 
+
+-   **COMID (Component ID):** This is a unique identifier primarily associated with the **NHDFlowline** features in the NHDPlusV2 data. An NHDFlowline represents a segment of a river, stream, or other linear water feature. Essentially, every stream segment has a unique COMID. The COMID can also be used as an identifier for the catchment polygon and value-added attributes that describe characteristics of the catchment's interior.
+
+-   **FeatureID:** This identifier is used for the **catchment** features in the NHDPlusV2 dataset, which are polygons representing the drainage area contributing to a specific flowline. A positive FeatureID always matches the COMID of the associated flowline, indicating the catchment drains into that particular flowline. A negative FeatureID, on the other hand, indicates a sink, a catchment without an associated flowline, implying it's an internal drainage basin or a closed lake
+
+Data processing based on module 4 in <https://github.com/cldolph/SoilP/tree/main/Soil_P_input>
+
+```{r}
+
+#Read in USGS and USDA NCSS data and clean up 
+
+usgs<-read.csv(paste0(dir.data, '/USGS_alldepths_soil_since2000_region_NWI_NHDv2100_NLCD06_ssurgo_catchment.csv'))
+ncss<-read.csv(paste0(dir.data, '/NCSS_alldepths_MajorElements_since2000_region_NLCD06_NHDv2100_NWI_ssurgo_catchment.csv'))
+
+names(usgs)
+#Look at date range:
+summary(as.Date(as.character(usgs$COLL_DATE), format = "%Y%m%d"))
+
+nrow(usgs)
+
+
+names(ncss)
+#Look at date range
+summary(as.Date(ncss$site_obsdate, format="%d/%m/%Y"))
+nrow(ncss)
+
+soilP_database<-rbind(
+  
+usgs %>% 
+  dplyr::select(LATITUDE, LONGITUDE, P_mgkg, max_depth_est, NLCD06, MUTKEY, FEATUREID, ATTRIBUTE, WETLAND_TYPE, COLL_DATE) %>% 
+  dplyr::rename(Date=COLL_DATE, x=LONGITUDE, y=LATITUDE) %>% 
+  mutate(Depth_cm=max_depth_est*2.54) %>% #convert depth to cm
+  dplyr::select(-max_depth_est), #drop old depth est
+                  
+ncss %>% 
+  dplyr::select(latitude_decimal_degrees, longitude_decimal_degrees, p_mjelm, hzn_bot, NLCD06, MUTKEY, FEATUREID, ATTRIBUTE, WETLAND_TYPE, Date) 
+%>% 
+  dplyr::rename(y=latitude_decimal_degrees, x=longitude_decimal_degrees, P_mgkg=p_mjelm, Depth_cm=hzn_bot)
+)
+  
+names(soilP_database)
+nrow(soilP_database)
+
+
+#Process column names
+modern.soil<-soilP_database %>%
+  dplyr::rename(comid=FEATUREID, MUKEY=MUTKEY, NLCD_Land=NLCD06) %>% 
+  dplyr::select('x', 'y', 'P_mgkg', 'Depth_cm', 'NLCD_Land', 'MUKEY','comid', 'ATTRIBUTE', 'WETLAND_TYPE') %>% 
+  mutate(dataset="USGS_USDA") %>%
+  na.omit() %>% #remove NAs
+  mutate(comid=ifelse(comid<1, comid*-1, comid)) %>%  #make all comid values positive (see note above)
+  dplyr::mutate(SampleID=row_number())#Create sample ID
+
+head(modern.soil)   
+
+#Write compiled modern upland soil data to file
+write.csv(modern.soil, paste0(dir.output, "/USGS_NCSS_soils_database_attributes_alldepths"), row.names=FALSE)
+```
+
+# 4 Map of sample locations
+
+Map of IL historic pedons, IL streambank locations, and USGS/USDA select region soil P
+
+## 4.1 Load US states in study region as a baselayer
+
+```{r}
+
+#read in USA state boundaries using tigris package
+states<-states()
+states_sf <- st_as_sf(states) #convert to sf object
+st_bbox(states_sf) #bounding box
+states_sf
+
+st_crs(states_sf) #check reference system
+
+#For area of interest, select states that overlap with measured P data
+#If using all USGS/USDA data
+states_subset<-states_sf %>% 
+  filter(STUSPS %in% c("AR", "IA", "IL", "IN", "KS", "MN", "MO", "NE", "ND", "OH", "SD", "WI"))
+
+
+```
+
+## 4.2 Combine all soil P datasets into single dataframe:
+
+```{r}
+
+names(modern.soil)
+names(IL_streambank_samples.clean)
+names(historic.YEAR)
+
+#Make dataset columns match datasets, add dataset label
+modern.soil$dataset="USGS_USDA"
+IL_streambank_samples.clean$dataset="Margenot_streambank"
+
+historic.YEAR<-historic.YEAR %>% 
+  mutate(dataset=TimeCat) %>% 
+  dplyr::mutate(x=as.numeric(Longitude), y=as.numeric(Latitude))
+
+#Create list of all data
+list_of_soil<-list(modern.soil, IL_streambank_samples.clean, historic.YEAR)
+list_of_soil
+
+#Make sure column and types names match
+
+#Function to convert depth to numeric
+convert_col_to_numeric <- function(df) {
+  df$Depth_cm <- as.numeric(df$Depth_cm)
+  return(df)
+}
+
+# Convert depth to numeric for all dataframes
+list_of_soil <- lapply(list_of_soil, convert_col_to_numeric)
+
+#ID columns needed to bind
+cols_needed<-c('y', 'x', 'P_mgkg', 'Depth_cm', 'dataset')
+
+
+#Combine all data
+
+big.soil<-bind_rows(list_of_soil) %>%  
+  dplyr::select(all_of(cols_needed))
+
+#View(big.soil)
+levels(factor(big.soil$dataset))
+```
+
+## 4.3 Manuscript figure: Map of sample locations
+
+```{r}
+#Create spatial object for all upland soil & streambank P locations
+
+names(big.soil)  
+
+#Note - exclude two samples with latitude in longitude column
+big.soil<-big.soil %>% dplyr::filter(x<0)
+
+
+big_soil_sf<-st_as_sf(big.soil %>% filter(!is.na(x)), coords=c("x", "y"), crs=4269)  
+
+
+#Create nicer labels for datasets 
+#keep all historic data together for map
+
+levels(factor(big_soil_sf$dataset))
+
+big_soil_sf<-big_soil_sf %>% 
+  mutate(dataset_label=ifelse(dataset=="pre-1950"|dataset=="post-1950", "Margenot_pedon", dataset))
+
+levels(factor(big_soil_sf$dataset_label))
+
+big_soil_sf$dataset_label=factor(big_soil_sf$dataset_label, levels=c("Margenot_pedon", "Margenot_streambank", "USGS_USDA"), labels=c("Historic IL soil pedons", "IL streambank samples", "Modern USGS/USDA soil pedons"))   
+
+#Create bigger bounding box for legend
+
+bbox_new <- st_bbox(big_soil_sf) 
+# current bounding box  
+xrange <- bbox_new$xmax - bbox_new$xmin # range of x values 
+yrange <- bbox_new$ymax - bbox_new$ymin # range of y values   
+bbox_new[1] <- bbox_new[1] - (0.15 * xrange) # xmin - left  
+bbox_new[3] <- bbox_new[3] + (0.15 * xrange) # xmax - right  
+bbox_new[2] <- bbox_new[2] - (0.25 * yrange) # ymin - bottom 
+bbox_new[4] <- bbox_new[4] + (0.2 * yrange) # ymax - top  
+bbox_new <- bbox_new %>%  # take the bounding box ...   
+  st_as_sfc() # ... and make it a sf polygon  
+
+# looks better, does it? 
+tm_shape(big_soil_sf, bbox = bbox_new)+   
+  tm_dots(col="dataset")  
+
+#Create inset map of US 
+# Create the inset (overview) map 
+names(states) 
+#View(states) 
+exclude.states<-c("HI", "PR", "AK", "MP", "VI", "GU", "AS")  
+
+CONUS<-states_sf %>% filter(!STUSPS %in% exclude.states)   
+
+inset_map <-    
+  tm_shape(CONUS, bbox=st_bbox(CONUS))+   
+    tm_polygons(col="gray", fill="gray")+   
+  tm_shape(states_subset) +   
+    tm_polygons(col = "black", fill="black") +   
+  tm_layout(frame = TRUE, bg.color = "white") 
+inset_map    
+
+#Main Map:  
+
+tmap_mode("plot")  
+
+Site.map <- 
+  tm_shape(big_soil_sf, bbox = bbox_new) +   
+  tm_symbols(fill = "dataset_label", size = 0.5, fill.scale = tm_scale(values = c("#1b9e77", "#d95f02", "#7570b3")), fill.legend = tm_legend(title = "")   ) +   
+tm_shape(states_subset)+   
+    tm_borders()+   
+tm_basemap(server = "CartoDB.PositronNoLabels")+   
+tm_compass(type = "arrow", position = c("right", "bottom")) +   
+tm_layout(     legend.position = c(0.45, 1.0),     title.position = c('right', 'top'),     legend.text.size = 1.4)
+Site.map  
+
+#Render the Combined Map
+#Clear any existing plot 
+grid::grid.newpage()  
+
+# Print the main map
+print (Site.map)  
+# Define the viewport for the inset # x and y are the center point of the inset (0 to 1 coordinates) # width and height are relative to the canvas size 
+
+vp_inset <- viewport(x = 0.4, y = 0.1, width = 0.3, height = 0.3) 
+# Print the inset map into that viewport 
+print(inset_map, vp = vp_inset)  
+
+#save map to file
+
+png(paste0(file.name=dir.figures, "/Fig1_soilP_ALL_locations_map.png"), width = 3000, height = 2400, res = 300)    
+
+grid.newpage() 
+print(Site.map) 
+
+vp_inset <- viewport(x = 0.275, y = 0.119, width = 0.3, height = 0.3) 
+print(inset_map, vp = vp_inset)  
+
+dev.off()
+```
+
+# 5 Summarize Soil P data
+
+## 5.1 Examine historic IL soil pedon data
+
+```{r}
+
+#Average, min and max TP for historic samples:
+big_soil_sf %>% 
+  filter(dataset=="Margenot_pedon") %>% 
+  summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg))
+
+
+#Average for historic samples, by year range
+historic.YEAR %>% 
+dplyr::group_by(TimeCat) %>% 
+  dplyr::summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg))
+```
+
+## 5.2 Mean P value for other datasets
+
+```{r}
+names(big.soil)
+
+levels(factor(big.soil$dataset))
+
+#USGS/USDA
+big.soil %>% filter(dataset=="USGS_USDA"& P_mgkg>0) %>% dplyr::summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg), sdP=sd(P_mgkg))
+
+#IL Streambank:
+big.soil %>% filter(dataset=="Margenot_streambank"& P_mgkg>0) %>% dplyr::summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg), sdP=sd(P_mgkg))
+
+#Percent above 1000 mg/kg
+
+big.soil %>% filter(dataset=="USGS_USDA"&P_mgkg>1000) %>% nrow()/big.soil %>% filter(dataset=="USGS_USDA") %>% nrow()
+
+
+big.soil %>% filter(dataset=="Margenot_streambank"&P_mgkg>1000) %>% nrow()/big.soil %>% filter(dataset=="Margenot_streambank") %>% nrow()
+```
+
+## 5.3 Manuscript figure: Plot P by depth category across datasets
+
+Note that the boxplot figure was not included in the final manuscript.
+
+```{r}
+
+
+#Make nice labels for datasets
+levels(factor(big.soil$dataset))
+
+big.soil$dataset<-factor(big.soil$dataset, levels=c("pre-1950", "post-1950", "USGS_USDA", "Margenot_streambank"),
+                          labels=c("historic IL soil pedons, 1925-1950", "historic IL soil pedons, 1950-1976", "post-2000 USGS/USDA soil pedons (IA, IL, IN, OH)", "IL Streambank samples"))
+
+#Make some depth categories
+
+big.soil2<-big.soil %>% 
+  mutate(DepthCat=ifelse(Depth_cm<75, "<75 cm", NA)) %>% 
+  mutate(DepthCat=ifelse(Depth_cm>=75&Depth_cm<300, "75-300 cm", DepthCat)) %>% 
+  mutate(DepthCat=ifelse(Depth_cm>=300, ">300 cm", DepthCat)) %>% 
+  mutate(DepthCat=factor(DepthCat, levels=c("<75 cm", "75-300 cm", ">300 cm")))
+
+#just 2 depth categories:
+big.soil2<-big.soil2 %>% 
+  mutate(DepthCat2=ifelse(Depth_cm<75, "<75 cm", ">75 cm"))
+
+
+-----------------------------------------
+###Boxplot showing P by depth category:
+
+Pdepth_boxplot<-ggplot(big.soil2 %>% filter(!is.na(DepthCat2)), aes(x=DepthCat2, y=P_mgkg, fill=dataset))+
+#geom_jitter(aes(DepthCat, P_mgkg, fill=dataset))+
+geom_boxplot()+
+scale_fill_brewer(palette="BrBG")+
+  xlab("Soil Depth")+
+ylab(bquote(Total~P~(mg~kg^-1)))+
+theme_bw()+
+theme(panel.grid=element_blank(), legend.title = element_blank(), legend.position="inside", legend.position.inside=c(0.5,0.85), axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14), legend.text=element_text(size=14), legend.background = element_rect(fill = "transparent"))
+Pdepth_boxplot
+
+#save to file
+png(paste0(file.name=dir.figures, "/Fig_P_depth_by_dataset_boxplot.png"), width = 6, height = 6, units="in", res = 300)    
+
+grid.newpage() 
+print(Pdepth_boxplot) 
+
+dev.off()     
+
+-------------------------------------------------
+###Scatterplot showing P by depth across datasets
+
+#add a mean line for each dataset
+meanP <- big.soil2 %>% 
+group_by(dataset) %>% 
+dplyr::summarise(mean_P = mean(P_mgkg))
+meanP
+
+#or a regression line, and y intercept will be mean
+
+Pdepth_scatter<-ggplot(big.soil2)+
+  geom_point(aes(Depth_cm, P_mgkg), alpha = 0.3)+
+  #geom_smooth(aes(Depth_cm, P_mgkg), method="lm", linetype="dashed")+
+  facet_wrap(~dataset, ncol=1)+
+  xlab("Soil Depth (cm)")+
+  ylab(bquote(Total~P~(mg~kg^-1)))+
+  theme_bw()+
+  theme(strip.text=element_text(size=14), axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    panel.grid.minor=element_blank(), panel.grid.major=element_blank())+
+  geom_text(data = meanP, aes(x = 700, y = mean_P, label = paste("mean=", round(mean_P, 0), "mg/kg", sep=" ")),
+            vjust = -5, color = "black")
+Pdepth_scatter
+
+#save to file
+
+png(paste0(file.name=dir.figures, "/Fig_P_depth_by_dataset.png"), width = 6, height = 6, units="in", res = 300)    
+
+grid.newpage() 
+print(Pdepth_scatter) 
+
+
+
+dev.off()     
+```
+
+# 6 Set Up Data For Assigning Attributes
+
+Select dataset of interest for linking to attributes in next module (or use big.soil dataset to link attributes for all locations)
+
+```{r}
+
+samples.clean<-modern.soil
+
+#OR
+
+samples.clean<-IL_streambank_samples.clean
+
+#OR
+
+samples.clean<-historic.samples.clean
+
+#OR (for assigning attributes to all samples from all datasets at once)
+
+samples.clean<-big.soil
+```
+
+# 7 Get area of interest and plot map
+
+i.e., areas intersecting sampled points
+
+```{r}
+names(samples.clean)
+
+#Convert streambank P locations to spatial object:
+loc_sf<-st_as_sf(samples.clean, coords=c("x","y"), crs=4269)
+
+#Retain lat/long as attribute columns
+loc_sf<-loc_sf %>% 
+mutate(x = st_coordinates(.)[,1], y = st_coordinates(.)[,2])
+
+
+#For area of interest, select states that overlap with measured P data
+#read in USA state boundaries using tigris package
+states<-states()
+states_sf <- st_as_sf(states) #convert to sf object
+st_bbox(states_sf) #bounding box
+states_sf
+
+st_crs(states_sf) #check reference system
+
+
+#ID states that intersect with measured data (Area of Interest)
+
+States_sub <- states_sf[loc_sf, ]
+
+#Quick plot of states
+plot(States_sub$geometry, col=alpha("blue",0.3))
+  
+
+
+#Quick plot of streambank P locations and states
+
+#choose interactive or static viewing:
+tmap_mode("plot")
+
+Sites.map<-tm_shape(States_sub)+
+  tm_borders()+
+tm_shape(loc_sf)+
+  tm_symbols(fill="P_mgkg", shape=21, size=0.5, fill.scale=tm_scale(values = rev(hcl.colors(4, "SunsetDark"))))+
+  tm_basemap(server="Esri.WorldGrayCanvas")+
+  tm_layout(legend.outside = TRUE, legend.outside.position = c("right", "top"))
+Sites.map
+
+#Save map if desired (note: these maps were not used in Manuscript)
+
+#tmap_save(Sites.map, filename=paste0(dir.figures, "/Margenot_IL_sites_map_PEDONS.jpg"), dpi=300)
+
+
+```
+
+## 7.1 Area of interest by state
+
+```{r}
+#Dissolve the boundaries between states to create a single contiguous polygon for the area of interest (AOI)
+States_AOI <- st_union(States_sub)
+
+plot(States_AOI)
+```
+
+## 7.2 Get hydrologic area of interest
+
+```{r}
+
+#Pull in HUC4 boundaries using nhdplusTools
+HUC4<-get_huc(AOI = States_AOI, type = "huc04")
+st_crs(HUC4) #check reference system
+names(HUC4)
+
+#plot locations of sample sites, states, and HUC4 boundaries
+
+tmap_mode("plot")
+
+tm_shape(HUC4)+
+  tm_borders(col="blue")+
+  tm_text("name", size = 0.5, col = "black", just = "center")+
+tm_shape(States_sub) +
+  tm_borders()+
+tm_shape(loc_sf)+
+  tm_dots()
+
+
+
+```
+
+## 7.3 Further subset study area
+
+To speed up geoprocessing, can subset area even smaller - ID relevant HUC4 or HUC8s that samples are located in
+
+```{r}
+#Create shapefile for HUC4s that encompass sample locations 
+
+HUC4_subset<-HUC4[loc_sf,] 
+
+#Plot
+tm_shape(HUC4_subset)+   
+  tm_borders(col="blue")+   
+tm_shape(loc_sf)+   
+  tm_dots()
+```
+
+Dissolve HUC4 boundaries to create a hydrologic AOI:
+
+```{r}
+
+HUC4_AOI <- st_union(HUC4_subset)
+
+plot(HUC4_AOI)
+
+```

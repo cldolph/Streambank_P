@@ -1,0 +1,343 @@
+---
+title: "module_SSURGO_limited_attributes"
+author: "Christy Dolph"
+date: "2025-09-25"
+output: html_document
+---
+
+# 6 alt overview:
+
+This is an alternative module to the SSURGO component of 'Module2_Assign_Geospatial_Predictors.Rmd'. This module merges sample locations only to attributes in the 'Component' and 'Valu1' tables of SSURGO. This module was written because some sample locations, if they are located in mapunits associated with water, do not have attributes in all SSURGO tables, particularly the Horizon-related tables.
+
+This presentation contains some relevant information about map units with water: <https://www.nawm.org/pdf_lib/mapping_webinar/galbraith_091714.pdf>
+
+"Water bodies and perennial rivers mapped as separate units."
+
+**This module should be run in place of Section 6.2 in Module 2.**
+
+## i. Load and assign limited SSURGO attributes
+
+First, specify appropriate attribute file
+
+```{r}
+
+#For streambank P samples
+#file.input<-paste0(dataset, "sample_attributes")
+
+#For soil P database:
+file.input<-"/USGS_NCSS_soils_database_attributes_alldepths"
+
+#for Margenot data:
+file.input<-"/Margenot_sample_attributes"
+
+file.input
+
+```
+
+## 6.2 Get SSURGO attributes by MUKEY
+
+This part of the script uses ssurgo geodatabases downloaded to the project folder as specified above. Note downloading gSSURGO data first and then working with it will likely be faster than trying to pull data in from servers.
+
+The following code is broken down by processing required for individual attribute tables in the gSSURGO dataset. At the end, attributes are subsetted and combined at the map unit scale.
+
+Download and unzip state gSSURGO files from <https://www.nrcs.usda.gov/resources/data-and-reports/gridded-soil-survey-geographic-gssurgo-database>
+
+see: "State Databases - soils - powered by Box"
+
+Put unzipped geodatabase folders in "spatial_data/ssurgo" folder
+
+See SSURGO attribute descriptions: <https://www.nrcs.usda.gov/sites/default/files/2022-08/SSURGO-Metadata-Table-Column-Descriptions-Report.pdf>
+
+### i. General Set Up
+
+```{r}
+
+#can ignore warnings about simple feature geometries not being present  
+options(warn=-1)  
+
+#Set directory for ssurgo data 
+ssurgo_dir<-paste0(dir.spatial, "/ssurgo") 
+ssurgo_dir  
+
+#ID states in study region 
+states<-as.list(States_sub$STUSPS) 
+states  
+
+#Read in soil sample locations, for file of interest  
+#Read in data: 
+P.streamcat<-read.csv(paste0(dir.output, file.input, '_streamcat', '.csv'))  
+nrow(P.streamcat)
+
+#Assign SampleID if needed
+names(P.streamcat)
+P.streamcat<-P.streamcat %>% 
+  mutate(SampleID=nrow(.))
+
+```
+
+### ii. Read in all the SSURGO layers you will need:
+
+Includes the following layers: "component", "chorizon", "chtexture", "chtexturegrp", "copm", "copmgrp", "Valu1"
+
+```{r}
+
+#Function to read one layer across all states
+read_layer <- function(layer) {
+  # Use map to create a list, then row-bind
+  res_list <- map(states, ~ {
+    gdb_path <- file.path(ssurgo_dir, paste0("gSSURGO_", .x, ".gdb"))
+    message("Reading ", layer, " for state: ", .x)
+    st_read(dsn = gdb_path, layer = layer, quiet = TRUE) %>%
+      mutate(State = .x)
+  })
+  
+  # Combine list into one data frame
+  list_rbind(res_list)
+}
+
+# Read multiple layers into a named list
+layers <- c("component", "Valu1")
+
+layer_data <- map(set_names(layers), read_layer)
+```
+
+### iii. Further processing of ssurgo attributes at the map unit (mukey) scale
+
+1.  Some SSURGO attributes are already summarized at the map unit scale. Others are summarized at scales smaller than the mapunit. To make everything consistent, attributes that occur at sub-map unit scales are combined (as weighted averages etc) to match the map unit scale.
+2.  Attributes are also subsetted to desired ssurgo attributes - ie, those likely to be related to P content - as per Records et al 2016 <https://doi.org/10.1016/j.earscirev.2016.04.010>. Attributes ending in "\_r" are selected as these are considered "representative" (according to SSURGO manual).
+3.  Note that the list of SSURGO attributes does include total P values (where available; most locations do not have total P values available)
+
+#### a. Component table: different soil types in a map unit
+
+'cokey' is the unique unit identifier for the component layer.
+
+```{r}
+#Create Component layer:
+Component<-layer_data$component
+
+
+#Check if component layers are unique --> they are
+nrow(Component)
+
+Component %>% 
+  dplyr::select(cokey) %>% 
+  distinct() %>% 
+  nrow()
+
+
+#Number of map units
+Component %>% dplyr::select(mukey) %>% distinct() %>% nrow()
+
+
+#Check map units against sample locations:
+P.streamcat %>% 
+  filter(!MUKEY %in% unique(Component$mukey))
+#-->All sample mapunits are in component table
+
+Component %>% 
+  filter(mukey %in% P.streamcat$MUKEY) %>% 
+  dplyr::select(cokey) %>% 
+  distinct()
+#-->are multiple components per map unit 
+
+#Find mukey associated with specific cokey
+Component %>% filter(mukey=="407496") %>% 
+  dplyr::select(mukey, cokey)
+
+##Subset to desired ssurgo attributes - ie, those likely to be related to P content (as per Records et al 2016) AND to mapunits that overlap with study sites
+
+#Subset Component attributes 
+names(Component)
+Component.list<-c('comppct_r', 'slope_r', 'slopelenusle_r','runoff',
+                  'erocl', 'hydricon', 'hydricrating', 'drainagecl', 'elev_r', 'geomdesc',
+                  'airtempa_r', 'reannualprecip_r', 'ffd_r', 'taxceactcl', 'taxreaction', 'taxpartsize',
+                  'mukey', 'cokey')
+
+
+Component.sub<-Component %>% 
+  dplyr::select(any_of(Component.list)) %>%  #select desired attributes
+  filter(mukey %in% P.streamcat$MUKEY) %>%  #subset mapunits to those overlapping with sample sites
+  dplyr::rename(MUKEY=mukey) #format MUKEY to match sample sites
+```
+
+#### b. Valu1 Table
+
+These are commonly used attributes already aggregated in SSURGO at the map unit scale
+
+```{r}
+
+valu1<-layer_data$Valu1
+
+names(valu1)
+#rename MUKEY column
+valu1<-valu1 %>% 
+  dplyr::rename(MUKEY=mukey)
+```
+
+### iv. Merge SSURGO attributes to the map unit scale.
+
+Merge everything to mukey; using cokey
+
+Need comppct from component table for % contribution of each component to each mukey (see below)
+
+NOTE: not all cokeys associated with sample locations have attributes in other tables, so use all.x=TRUE to keep all sample locations
+
+```{r}
+#COMPLETE LIST OF SSURGO TABLES NEEDED:
+names(Component.sub) #component unit (cokey)
+names(valu1) #map unit (mukey)
+
+```
+
+### v. Summarize/aggregate gSSURGO attributes at the map unit scale
+
+Steps:
+
+1.  Check column types to make sure each is designated as correct type (either numeric or factor).
+2.  Simplify/reclassify categorical attributes with many levels.
+3.  Summarize component scale attributes at the map unit scale.
+4.  For numeric variables, take weighted average for each map unit.
+5.  For categorical variable, take component with highest % of map unit for each sample. (For ties, the first row in each group is arbitrarily selected)
+
+Weights are 'comppct_r' - i.e., the percent of each component in the map unit (the mukey)
+
+**Check attribute type and reclassify attributes as needed:**
+
+```{r}
+sapply(Component.sub, class)
+
+#rename table to be consistent with main script
+Comp2<-Component.sub
+
+#Assign correct class to each attribute
+names(Comp2)
+#ID numeric variables
+Numeric.list <- c("slope_r", "slopelenusle_r", "elev_r", "airtempa_r", "reannualprecip_r",
+  "ffd_r", "comppct_r"
+)
+
+
+#ID categorical variables
+Categorical.list <- c("runoff", "erocl", "hydricon", "hydricrating", "drainagecl", "taxpartsize", "taxceactcl", "taxreaction", "MUKEY")
+
+
+#Variables to exclude or modify (eg, aggregate or code dummy variables):
+#geomdesc - too many levels
+
+
+#Transform numeric and categorical attributes as appropriate:
+Comp2 <- Comp2 %>%
+  mutate(across(all_of(Numeric.list), as.numeric)) %>% 
+  mutate(across(all_of(Categorical.list), as.factor)) %>% 
+  mutate(MUKEY=as.factor(MUKEY), taxpartsize=as.factor(taxpartsize), taxreaction=as.factor(taxreaction), taxceactcl=as.factor(taxceactcl))
+
+summary(Comp2)
+```
+
+**Summarize Attributes:**
+
+For each soil sample, calculate the weighted average of numeric attributes at the map unit scale that occur at the component scale. Select the categorical attributes with the highest component area.
+
+Note that it is possible to have more than one sample at the same location but at different sample depths. Thus, samples are also assigned the corresponding most closely matching horizon depths from the Chorizon table in SSURGO prior to calculating weighted averages. To do this, before summarizing component attributes, assign horizon depth to sample sites. This should result in the assignment of one of *each* the cokeys in a map unit (MUKEY) to each sample. (Otherwise the sample will be assigned to multiple horizons).
+
+```{r}
+#Steps:
+#Join SSURGO attributes to sample data (P.streamcat) based on mukey
+#then select rows where actual measured Depth_cm is between Chorizon table hzdepth values
+#hzdepb_r = bottom depth of a horizon
+#hzdept_r = top depth of a horizon 
+
+
+#Note, must use allow.cartersian=TRUE or otherwise get an error, because of the one to many join
+P.ssurgo1<-merge(P.streamcat, Comp2, by=c("MUKEY"), allow.cartesian=TRUE)
+
+#filter if Depth of soil sample is between hz levels
+#not applicable for limited SSURGO attributes (ie, if horizon tables have been excluded)
+#P.ssurgo.depth<-P.ssurgo1 %>%
+#  filter(Depth_cm <= hzdepb_r & Depth_cm >= hzdept_r)
+
+#Check that it worked for a samples in a select mapunit: 
+#View(P.ssurgo.depth %>% dplyr::select(MUKEY, cokey, SampleID, comppct_r, hzname, hzdept_r, hzdepb_r, Depth_cm, kffact) %>% filter(MUKEY=="100040"))
+
+
+
+#For numeric attributes - 
+#calculate weighted mean for each sample in each map unit (MUKEY). Weights are % contribution of each component (comppct_r) to the total map unit area. 
+#calculate for multiple attributes at once
+
+Mukey.mean<-P.ssurgo1 %>% group_by(MUKEY, SampleID) %>% 
+  summarise_at(Numeric.list, 
+               list(~weighted.mean(., comppct_r)))
+names(Mukey.mean)
+
+#Check result:
+#View(Mukey.mean %>% dplyr::select(MUKEY, SampleID, kffact, comppct_r) %>% filter(MUKEY=="100040"))
+
+
+#For categorical attributes - 
+#select component level with the highest percentage area in the map unit, for each sample
+
+#group by mukey and sample ID
+#apply just across columns in Categorical.list
+#select attribute levels in each group based on max compcct_r
+#note this will just pick the first value if there is a tie:
+#(somewhat arbitrary)
+
+Mukey.top_cat<-P.ssurgo1 %>% 
+  dplyr::select(MUKEY, SampleID, comppct_r, all_of(Categorical.list)) %>%
+  group_by(MUKEY, SampleID) %>% 
+  dplyr::slice(which.max(comppct_r))
+
+# View the result
+#View(Mukey.top_cat %>% dplyr::select(MUKEY, SampleID, pmorigin, comppct_r) %>% filter(MUKEY=="100040"))
+
+##So now you have:
+#weighted average for numeric variables for each sample site in each map unit
+#categorical attribute with highest percentage area for each sample site in map unit
+
+```
+
+Merge numeric and categorical SSURGO attributes to all other attributes and write to file:
+
+```{r}
+#Merge the two;
+SSURGO.att<-merge(Mukey.mean, Mukey.top_cat, by=c('MUKEY', 'SampleID'))
+head(SSURGO.att)
+#View(SSURGO.att)
+
+#Add in attributes from Valu1 table
+SSURGO.all<-merge(SSURGO.att, valu1, by=c('MUKEY'))
+head(SSURGO.all)
+
+#Check that mukeys for sample locations were included
+if(nrow(P.streamcat)==
+P.streamcat %>% 
+  filter(MUKEY %in% unique(SSURGO.all$mukey)) %>% 
+  nrow()
+)
+{message("yes all sample locations have mapunit data after merging with valu1 table")} else{
+  message("some mapunits missing")
+}
+
+#Note: some mukeys may have been omitted if they were not in all SSURGO tables - this seems to occur for map units associated with water areas
+
+```
+
+## vi. Merge ssurgo attributes to sample locations
+
+```{r}
+#Merge back to all other attributes previously added for sample locations:
+soilP.att<-merge(P.streamcat, SSURGO.all, by=c("SampleID", "MUKEY"))
+#View(soilP.att)
+nrow(soilP.att)
+
+#write to table;
+#these are unique attributes for each map unit, from multiple SSURGO tables
+
+write.table(soilP.att, paste0(dir.output, file.input,'_SSURGO_attributes_mapunit_LIMITED.csv'), sep=",", row.names=FALSE)
+
+```
+
+# Resume 'Module2_Assign_Geospatial_Predictors.Rmd' at section:
+
+# '7 Clean up all attributes'
