@@ -1,0 +1,2064 @@
+---
+title: "module_tune_models"
+author: "Christy Dolph"
+date: "2025-08-07"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1 Install and load the required libraries
+
+```{r}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Clean up workspace 
+rm(list=ls())
+
+
+#list of necessary packages 
+want <- c('data.table', 'xgboost', 'caret', 'dplyr', 'ggplot2', 'scales', 'tidymodels', 'missRanger', 'doParallel', 'DALEXtra', 'vip', 'grid', 'stringr')
+
+need <- want[!(want %in% installed.packages()[,"Package"])]
+if (length(need)) install.packages(need)
+lapply(want, function(i) require(i, character.only=TRUE))
+rm(want, need)
+
+#Main directory
+dir.root<-getwd()
+
+#Input data
+dir.data<-paste(dir.root, "/Streambank_P_measured_data", sep="")
+
+#Spatial data
+dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
+
+#Output data (produced by script)
+dir.output<-paste0(dir.root, "/output_data")
+
+dir.figures<-paste0(dir.root, '/Maps_figures')
+
+```
+
+# 2 Load the dataset
+
+```{r}
+
+#Select the input data you'd like to use: 
+
+#Margenot et al IL streambank P data, with limited ssurgo attributes to retain all data, for independent streambank model or for running through existing soil TP model (predictors are matched below): 
+model.input<-"/Margenot_sample_attributes_for_modelling_wSSURGO_LIMITED"
+
+
+#Modern upland Soil P database:
+#model.input<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling'
+
+#Modern upland soil P database but with limited ssurgo attributes that should encompass water areas?
+#model.input<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED'
+
+P_dataset <-read.csv(paste0(dir.output, model.input, '.csv'))
+                    
+names(P_dataset) 
+nrow(P_dataset)
+#View(P_dataset)
+
+#Check class of all attributes
+sapply(P_dataset, class)
+
+
+#Convert characters to factors:
+P_dataset <- P_dataset %>% 
+  type.convert(as.is=FALSE)
+
+#Convert integer attributes to numeric:
+integer_cols <- sapply(P_dataset, is.integer)
+P_dataset[integer_cols] <- lapply(P_dataset[integer_cols], as.numeric)
+
+# Check the class of columns
+sapply(P_dataset, class)
+
+#Make name of P_mgkg column consistent
+#NOTE: need to fix this later! (not working)
+P_dataset<-P_dataset %>%
+  { if ("meanP_mgkg" %in% names(.)) rename(., P_mgkg = meanP_mgkg) else . }
+```
+
+# 3 Explore the data
+
+## 3.1 Distribution of streambank P values
+
+```{r}
+
+nrow(P_dataset)
+
+#Histogram of P
+P.hist<-
+  ggplot(P_dataset, aes(P_mgkg))+
+  #geom_histogram(binwidth = 1,colour = "lightgray", fill = "darkgrey") +
+  geom_histogram(binwidth=10, colour = "black", fill ="black") +
+  #geom_vline(aes(xintercept=mean(P_mgkg)), linetype="dashed", color="blue")+
+  geom_vline(aes(xintercept=mean(P_mgkg)), linetype="dashed", color="purple", linewidth=1.5)+
+  #geom_vline(aes(xintercept=1000), linetype="dotdash", color="black")+
+  #geom_vline(aes(xintercept=1000), linetype="dotdash", #color="darkgray", linewidth=1.5)+
+  xlab("P (mg/kg)") +
+  ylab ("Frequency") +
+  #ggtitle("Near Channel Soil P distribution")+
+  #ggtitle("Soil P Samples distribution") +
+  theme(axis.title = element_text(size=20))+
+  theme(axis.text=element_text(size=20))+
+  #theme_bw()+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+  #theme(plot.title = element_text(size = 26, face = "bold", hjust=0.5))
+P.hist
+
+summary(P_dataset$P_mgkg)
+
+#Percent of values over 1000 mg/kg
+nrow(P_dataset)
+
+P_dataset %>% filter(P_mgkg>1000) %>% nrow()
+
+
+```
+
+Plot streambank P vs bulk density
+
+```{r}
+
+ggplot(P_dataset) +
+  geom_point(aes(meanBD_gcm3, P_mgkg))
+
+```
+
+## 3.2 Check class of all variables
+
+```{r}
+summary(P_dataset)
+class(P_dataset)
+
+
+```
+
+Create correct/matching levels for NLCD attribute
+
+```{r}
+#Set NLCD_Land to categorical
+
+levels(factor(P_dataset$NLCD_Land))
+
+#For Margenot Streambank samples, get levels to match soil TP:
+P_dataset$NLCD_Land<-factor(P_dataset$NLCD_Land,
+                       labels=c("Barren Land", "Cultivated Crops", "Deciduous Forest", "Developed, Low Intensity", "Developed, Open Space", "Emergent Herbaceous Wetlands", "Pasture/Hay", "Mixed Forest", "Open Water", "Woody Wetlands"))
+
+#For big soil TP dataset, set factor levels:
+P_dataset$NLCD_Land<-factor(P_dataset$NLCD_Land, 
+                            levels=c('11','21','22','23','24','31','41','42','43','52', '71','81','82','90','95'),
+                            labels=c('Open Water', 'Developed, Open Space', 'Developed, Low Intensity','Developed, Medium Intensity', 'Developed, High Intensity', 'Barren Land','Deciduous Forest','Evergreen Forest','Mixed Forest','Shrub/Scrub','Grassland/Herbaceous', 'Pasture/Hay','Cultivated Crops','Woody Wetlands','Emergent Herbaious Wetlands'))
+
+levels(P_dataset$NLCD_Land)
+```
+
+Assign correct variable type to remaining variables:
+
+```{r}
+#Set remaining categorical attributes to factor
+cat_vars <- names(P_dataset)[sapply(P_dataset, function(x) is.factor(x) | is.character(x))]
+cat_vars
+
+P_dataset<-P_dataset %>% 
+  mutate(across(cat_vars, as.factor))
+
+
+#Set remaining numeric attributes to numeric
+dep_var="P_mgkg"
+num_vars <- names(P_dataset)[sapply(P_dataset, is.numeric) & names(P_dataset) != dep_var]
+num_vars
+
+P_dataset <- P_dataset %>%
+  mutate(across(num_vars, as.numeric))
+
+#Check all columns
+sapply(P_dataset, class)
+```
+
+## 3.3 Relationship to other variables
+
+### a. Categorical attributes
+
+```{r}
+
+#For categorical attributes, plot boxplots:  
+
+#full dataset:
+df<-P_dataset
+
+dep_var="P_mgkg"
+cat_vars <- names(df)[sapply(df, function(x) is.factor(x) | is.character(x))]
+
+
+# Open a PDF device
+pdf(paste0(dir.output, model.input, "_boxplots_by_category.pdf"))
+
+# Loop through categorical variables and plot to PDF (one per page)
+walk(cat_vars, function(cat_var) {
+  p <- ggplot(df, aes_string(x = cat_var, y = dep_var)) +
+    geom_boxplot(fill = "skyblue", color = "black") +
+    labs(title = paste("Boxplot of", dep_var, "by", cat_var)) +
+    theme_minimal()+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+  
+  print(p)  # important to print inside loop when saving
+})
+
+# Close PDF device
+dev.off()
+
+```
+
+### b. Numeric attributes
+
+```{r}
+
+#full dataset:
+df<-P_dataset
+
+num_vars <- names(df)[sapply(df, is.numeric) & names(df) != dep_var]
+
+# Open a PDF device (all plots go here, one per page)
+pdf(paste0(dir.output, model.input, "_scatterplots_", dep_var, ".pdf"))
+
+# Loop through numeric variables and plot
+walk(num_vars, function(num_var) {
+  
+  # Fit linear model
+  formula <- as.formula(paste(dep_var, "~", num_var))
+  model <- lm(formula, data = df)
+  r2 <- summary(model)$r.squared
+  
+  # Create scatterplot with R² annotation
+  p <- ggplot(df, aes_string(x = num_var, y = dep_var)) +
+    geom_point(color = "steelblue", alpha = 0.7) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("Scatterplot of", dep_var, "vs", num_var)) +
+    annotate("text", 
+             x = Inf, y = Inf, 
+             label = paste0("R² = ", round(r2, 3)), 
+             hjust = 1.1, vjust = 1.5, size = 5, color = "black") +
+    theme_minimal()
+  
+  print(p)  # each plot on a new page
+})
+
+# Close PDF device
+dev.off()
+```
+
+### c. Manuscript figure (Appendix): Examine relationships among glacial till attributes
+
+```{r}
+names(P_dataset)
+
+#Parent material:
+
+parent<-c("pctglactilclayws",
+"pctglaclakefinews",
+"pctglaclakecrsws",
+"pcteolcrsws",
+"pctglactilloamws",
+"pctglactilcrsws",
+"pctalluvcoastws",
+"pctcolluvsedws",
+"clayws",
+"pctglactilcrscat",
+"pctglactilclaycat")
+
+soils<-P_dataset %>% dplyr::select(all_of(parent))
+
+ggplot(soils)+
+  geom_point(aes(pctglactilclayws, pctglactilloamws))
+
+reg<-with(soils, lm(pctglactilloamws ~ pctglactilclayws))
+summary(reg)
+```
+
+# 4 Data Preparation
+
+### 4.1 Remove any remaining administrative attributes:
+
+```{r}
+P_dataset<-P_dataset %>% dplyr::select(-musumcpct, -musumcpcta, -musumcpcts)
+
+```
+
+### 4.2 Option to remove x and y as predictors
+
+```{r}
+P_dataset<-P_dataset %>% dplyr::select(-x, -y)
+```
+
+### 4.3 Option to restrict to samples with TP \<1000 mg/kg
+
+```{r}
+P_dataset<-P_dataset %>% filter(P_mgkg<1000)
+```
+
+### 4.4 Option to remove outlier(s)
+
+Note we did not remove outliers for the streambank model.
+
+```{r}
+# Calculate the 0.5th and 99.5th percentiles 
+data_vector<-P_dataset$P_mgkg 
+
+lower_bound <- quantile(data_vector, 0.005) 
+lower_bound  
+
+upper_bound <- quantile(data_vector, 0.995) 
+upper_bound  
+
+# Remove outliers 
+data_without_outliers <- P_dataset %>%    
+  filter(P_mgkg>lower_bound & P_mgkg<upper_bound) 
+nrow(data_without_outliers)
+
+#Option to set data as full dataset, or without outliers
+#without outliers:
+P_dataset<-data_without_outliers
+
+summary(P_dataset$P_mgkg)
+```
+
+### 4.5 Omit attributes with mostly NA values or with no information (standard deviation of 0)
+
+Machine learning models can't handle NA, so need to either drop attributes that have NA or impute missing values (below)
+
+BUG: this may not be dropping columns that have blank rather than NA??
+
+```{r}
+
+
+#Identify columns containing NA values:
+cols_with_na <- P_dataset %>%
+  dplyr::select_if(~any(is.na(.))) %>%
+  colnames()
+
+# Print the names of columns with NA values
+print(cols_with_na)
+
+#Identify columns that are >50% NA values
+
+cols_to_remove<-P_dataset %>%
+  dplyr::select_if(~ mean(is.na(.)) > 0.5) %>% 
+  names()
+
+print(cols_to_remove)
+
+#Remove columns that are >50% NA
+
+P_dataset<-P_dataset %>% 
+  dplyr::select(-all_of(cols_to_remove))
+
+names(P_dataset)
+
+#ID columns with no information (numeric)
+cols_no_info<-P_dataset %>% 
+   dplyr::select(where(is.numeric)) %>% 
+dplyr::select(where(~ sd(.x, na.rm = TRUE) == 0)) %>% names()
+
+print(cols_no_info)
+
+#Omit predictors with no information (standard deviation of 0)
+P_dataset <-P_dataset %>% 
+  dplyr::select(-all_of(cols_no_info))
+
+```
+
+### 4.6 Drop or reclassify factor levels with only one representative (one data point):
+
+ID factors that have a level with only one data point. If these factors are included ML models typically won't run.
+
+```{r}
+cols_with_single_point_levels <- P_dataset %>%
+  dplyr::select(where(is.factor)) %>% # Select only factor columns
+  sapply(function(x) any(table(x) == 1)) %>% # Check if any level has count 1
+  names(.)[.] # Get the names of columns where the condition is TRUE
+
+cols_with_single_point_levels
+```
+
+Reclassify or drop factors:
+
+```{r}
+
+
+#Drop remaining attributes
+cols_with_single_point_levels <- P_dataset %>%
+  dplyr::select(where(is.factor)) %>% # Select only factor columns
+  sapply(function(x) any(table(x) == 1)) %>% # Check if any level has count 1
+  names(.)[.] # Get the names of columns where the condition is TRUE
+
+cols_with_single_point_levels
+
+P_dataset<-P_dataset %>% 
+  dplyr::select(-any_of(cols_with_single_point_levels))
+
+names(P_dataset)
+```
+
+### 4.7 Identify & remove highly correlated predictors
+
+While xgboost and other ML models are typically robust to multi-collinearity, reducing the number of features in the model by eliminating redundant/correlated variables can help with 1) model training time, 2) interpretation of the model in terms of variable importance and 3) may offer some performance gains.
+
+Note: you can only do this for numeric variables where data isn't missing! So will need to exclude NA rows and categorical variables
+
+Use the findCorrelation() function from the caret package to remove correlated variables while keeping the one of a correlated pair:
+
+-   From the function documentation: "If two variables have a high correlation, the function looks at the mean absolute correlation of each variable and removes the variable with the largest mean absolute correlation." In other words, it considers both negative and positive correlations by using the absolute value
+
+-   the function chooses one of the two variables from a pair based on how correlated it is with all the other variables
+
+-   Note: this correlation matrix includes the dependent variable, so need to think about if you want to include that
+
+```{r}
+# Calculate the correlation matrix
+
+set.seed(123)
+cor_matrix <- P_dataset %>% 
+  dplyr::select(where(is.numeric)) %>% 
+  na.omit() %>% 
+  dplyr::select(where(~ sd(.) > 0)) %>% 
+  cor(use = "pairwise.complete.obs") # 'use' argument handles remaining NAs safely
+
+# View highly correlated pairs
+
+cor_matrix_view <- cor_matrix 
+
+# Set upper triangle to NA in the copy only
+cor_matrix_view[upper.tri(cor_matrix_view, diag = TRUE)] <- NA
+
+# Flatten and filter the copy
+high_correlations <- cor_matrix_view %>%
+  as.table() %>%
+  as.data.frame() %>%
+  filter(!is.na(Freq)) %>%          # Remove the NAs we just made
+  mutate(Freq_abs = abs(Freq)) %>% 
+  filter(Freq_abs > 0.8) %>% 
+  arrange(desc(Freq_abs))
+
+#View(high_correlations)
+
+#View(high_correlations %>% filter(Var1=="pctcrop2011ws"|Var1=="pctcrop2011cat"))
+
+#Use findCorrelation() to drop highly correlated variables - 
+#first ID indices of highly correlated predictors
+
+highly_correlated_indices <- findCorrelation(cor_matrix, cutoff = 0.80, exact = FALSE)
+
+# Extract names to remove
+cor_cols_to_remove <- colnames(cor_matrix)[highly_correlated_indices]
+print(cor_cols_to_remove)
+
+#Remove highly correlated variabes
+P_dataset <- P_dataset %>%
+  dplyr::select(-all_of(cor_cols_to_remove))
+
+P_dataset %>% 
+    dplyr::select(order(colnames(.))) %>% 
+  names()
+
+```
+
+# 5 Split data into training and testing
+
+For remaining attributes, impute missing values. But first, must split data into training and testing datasets (to prevent data leakage).
+
+```{r}
+set.seed(123)
+P_split <- initial_split(P_dataset, strata = P_mgkg)
+#Note - Stratification ensures that the distribution of a variable is preserved across training and testing sets.
+#Default split is 75% data in train, 25% in test
+
+P_train <- training(P_split)
+nrow(P_train)
+names(P_train)
+
+P_test <- testing(P_split)
+nrow(P_test)
+names(P_test)
+```
+
+# 6 Impute missing values:
+
+```{r}
+#Separate out predictor variables from dependent variable (P_mgkg):
+#Also dropping bulk density for now
+
+Predictors<-P_train %>% 
+  dplyr::select(-any_of(c("P_mgkg", "BD_gcm3")))
+
+#R with parameters set to run faster
+
+start_time <- Sys.time()
+start_time
+dataImputed <- missRanger(Predictors,
+                          formula = . ~ . ,
+                          num.trees = 100, 
+                          verbose = 1, seed = 111)
+
+end_time <- Sys.time()
+end_time - start_time
+
+nrow(dataImputed)
+#View(P_train)
+#View(dataImputed)
+
+#rematch to soil P
+P.Predictors<-cbind(P_train$P_mgkg, dataImputed) 
+P.Predictors<-P.Predictors %>% 
+  dplyr::rename(P_mgkg = `P_train$P_mgkg`)
+
+#View(P.Predictors)
+
+###
+#Impute *testing data* separately (for use in model testing later)
+#Combine with predictor attributes to have more data to impute missing values
+
+dataImputed<-P.Predictors %>% 
+  dplyr::select(-P_mgkg)
+names(dataImputed)
+
+
+Test.impute<-rbind(
+  (P_test %>% 
+    dplyr::select(-any_of(c("P_mgkg", "BD_gcm3")))),
+dataImputed)
+nrow(Test.impute)
+
+start_time <- Sys.time()
+start_time
+data.Test.Imputed <- missRanger(Test.impute,
+                                formula = . ~ . ,
+                                num.trees = 100, 
+                                verbose = 1, seed = 111)
+
+end_time <- Sys.time()
+end_time - start_time
+
+#select out test data; and attach to soil P
+test<-data.Test.Imputed[c(1:nrow(P_test)),]
+P.test<-P_test %>% dplyr::select(P_mgkg)
+P.test
+test.prep<-cbind(P.test, test)
+nrow(test.prep)
+
+View(P_test)
+View(test.prep)
+
+names(P_test)
+names(test.prep)
+```
+
+## 6.1 Remove factors that only have 1 data point in any level
+
+This is to ensure the model does not crash because there is a level in the test dataset that does not occur in the training dataset.
+
+We also need to check if all levels of factors in the test data occur in the training dataset.
+
+```{r}
+#Do all factor levels in test dataset have an example in train dataset?
+
+#eg, all factor levels in test data should occur in train data:
+levels(factor(test.prep$NLCD_Land))
+levels(factor(P.Predictors$NLCD_Land))
+
+#Check if all levels of all factors in test data occur in train data: 
+df1<-test.prep
+df2<-P.Predictors
+
+# Identify factor columns in df1
+factor_cols_df1 <- names(df1)[sapply(df1, is.factor)]
+factor_cols_df1
+
+
+results <- lapply(factor_cols_df1, function(col_name) {
+  if (col_name %in% names(df2) && is.factor(df2[[col_name]])) {
+    levels_not_in_df2 <- setdiff(levels(df1[[col_name]]), levels(df2[[col_name]]))
+    if (length(levels_not_in_df2) > 0) {
+      return(paste0("Levels in '", col_name, "' of df1 not found in df2: ",
+                    paste(levels_not_in_df2, collapse = ", ")))
+    } else {
+      return(paste0("All levels of '", col_name, "' in test dataset are present in predictor dataset."))
+    }
+  } else {
+    return(paste0("Column '", col_name, "' is not a factor in predictor dataset or does not exist in predictor dataset."))
+  }
+})
+
+# Print the results
+for (res in results) {
+  print(res)
+}
+
+
+#ID factors in training data with only a single data point in a given level: 
+
+train_with_single_point_levels <- P.Predictors %>%
+  dplyr::select(where(is.factor)) %>% # Select only factor columns
+  sapply(function(x) any(table(x) == 1)) %>% # Check if any level has count 1
+  names(.)[.] # Get the names of columns where the condition is TRUE
+train_with_single_point_levels
+
+#Drop factors from train and test with only a single data point in a given level 
+
+P.Predictors <- P.Predictors %>%
+  dplyr::select(-any_of(train_with_single_point_levels))
+
+names(P.Predictors)
+
+#Drop same factors from test data:
+
+test.prep<-test.prep %>%
+  dplyr::select(-any_of(train_with_single_point_levels))
+
+names(test.prep)    
+
+#check column match - should be 0 columns in test that are not in Predictors
+check.col <- names(test.prep)[!names(test.prep) %in% names(P.Predictors)]
+check.col
+```
+
+Write imputed and cleaned data to file
+
+```{r}
+#WRITE IMPUTED DATA TO FILE
+#(note this is training data only)
+write.table(P.Predictors, paste0(dir.output, "/Final_model_comparisons", model.input, "_train_imputed_less1000_reducedCor_03032026.csv"), sep=",", row.names=FALSE)
+
+write.table(test.prep, paste0(dir.output, "/Final_model_comparisons", model.input, "_TEST_imputed_less1000_reduced_Cor_03032026.csv"), sep=",", row.names=FALSE)
+
+```
+
+# 7 Tune model hyperparameters
+
+## 7.1 Random Forest
+
+#### a. Run Version of Original Model from Dolph et al 2023
+
+```{r}
+#Define recipe to use in both model types 
+
+P_recipe_RF <- 
+  # which consists of the formula (outcome ~ predictors)
+  recipe(P_mgkg ~ ., data = P.Predictors) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors())
+  #Other options excluded for now, eg:
+  #%>%
+  #step_dummy(all_nominal()) #%>%
+  #step_impute_bag(all_predictors(), trees=100) #option to impute missing values, using all other predictors
+P_recipe_RF
+
+
+P_train_preprocessed <- P_recipe_RF %>%
+  # apply the recipe to the training data
+  prep(P.Predictors) %>%
+  # extract the pre-processed training dataset
+  juice()
+P_train_preprocessed
+names(P_train_preprocessed)
+
+#So need to bake() and not juice
+P_test_preprocessed <- P_recipe_RF %>%
+  # apply the recipe to the training data
+  prep(P.Predictors) %>%
+  # extract the pre-processed testing dataset
+  bake(new_data=test.prep)
+nrow(P_test_preprocessed)
+names(P_test_preprocessed)
+
+short_model_RF<-
+  rand_forest(
+    mtry = 50, 
+    min_n=3, 
+    trees = 1000) %>%
+  set_mode("regression") %>%
+  set_engine("randomForest")
+
+#put into workflow
+short_wf_RF<-workflow()%>%
+  add_recipe(P_recipe_RF) %>%
+  add_model(short_model_RF)
+
+
+#run models
+RF_fit<-short_wf_RF %>%
+  fit(P_train_preprocessed)
+RF_fit
+summary(RF_fit)
+
+
+#Check performance
+names(P_test_preprocessed)
+
+randfor_pred<-predict(RF_fit, new_data=P_test_preprocessed) 
+#add predictions to test data:
+RF.pred<-as.data.frame(cbind(P_test_preprocessed, randfor_pred))
+
+names(RF.pred)
+
+#check R2 value for actual vs predicted
+reg.AO<- with(RF.pred,lm(P_mgkg~.pred))
+summary(reg.AO)
+
+
+RMSE = mean((RF.pred$P_mgkg - RF.pred$.pred)^2) %>% sqrt()
+RMSE
+
+#Variable Importance, previous method:
+##RUN CONDITIONAL PERMUTATION IMPORTANCE:
+#read in saved model if needed;
+
+
+#Need to rerun model using randomforest() package
+
+start_time <- Sys.time()
+start_time
+
+set.seed(542863)
+rfP_model <- randomForest(P_mgkg ~ ., data = as.data.frame(P_train_preprocessed), mtry = 50, ntree=1000, replace = FALSE, 
+                          nodesize = 3
+                          , keep.forest = TRUE, keep.inbag = TRUE)
+end_time <- Sys.time()
+end_time - start_time
+
+summary(rfP_model)
+
+#Note: permimp does require training data to run!
+
+library(permimp)
+
+start_time <- Sys.time()
+start_time
+
+CPI_permimpRF <- permimp(rfP_model, 
+conditional = TRUE, progressBar = TRUE, do_check=FALSE)
+
+CPI_permimpRF
+end_time <- Sys.time()
+end_time - start_time
+
+#Rank importance values and plot a subset:
+#Make a dot plot:
+library(dplyr)
+library(ggplot2)
+VarImp<-as.data.frame(sort(CPI_permimpRF$values, decreasing=TRUE), optional=T)
+colnames(VarImp)[1]<-"Imp"
+rownames(VarImp)
+VarImp2 <- cbind(rownames(VarImp), data.frame(VarImp, row.names=NULL))
+colnames(VarImp2)[1]<-"Var"
+head(VarImp2)
+View(VarImp)
+VarImp2[1:75,]
+
+
+#save permimp object!
+saveRDS(CPI_permimpRF, paste0(dir.output, model.input, "_permimp_results_less1000.rds"))
+
+
+```
+
+#### b. Tune New Random Forest Models
+
+```{r}
+
+library(foreach)
+library(ranger)
+
+
+P_recipe_RF <- 
+  # which consists of the formula (outcome ~ predictors)
+  recipe(P_mgkg ~ ., data = P.Predictors) %>%
+  #step_center(all_numeric_predictors()) %>%
+  #step_scale(all_numeric_predictors()) %>% 
+  #Other options excluded for now, eg:
+  step_dummy(all_nominal()) 
+
+doParallel::registerDoParallel()
+
+tune_spec <- rand_forest(
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune()
+) %>%
+  set_mode("regression") %>%
+  set_engine("ranger")
+
+#specify cross validation for the training dataset, note that default is k=10 folds
+set.seed(234)
+P_folds <- vfold_cv(P.Predictors)
+
+###
+#PUT EVERYTHING TOGETHER IN A WORKFLOW
+
+tune_wf <- workflow() %>%
+  add_recipe(P_recipe) %>%
+  add_model(tune_spec)
+
+
+###
+#TUNE THE PARAMETERS
+
+#Check start time for initial tuning
+start_time <- Sys.time()
+start_time
+
+set.seed(345)
+tune_res <- tune_grid(
+  tune_wf,
+  resamples = P_folds,
+  grid = 20,
+  control = control_grid(save_pred = TRUE, verbose=TRUE)
+)
+tune_res
+
+
+#Check end time for initial tuning: 
+end_time <- Sys.time()
+end_time - start_time #took ~3 min
+
+
+#Check out initial tuning results
+tune_res %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "parameter") %>%
+  arrange(mean) %>%
+  print(n=40) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "rsq")
+
+
+#find the best set:
+best_rmse1<-select_best(tune_res, metric="rmse")
+best_rmse1
+
+
+####
+#FINALIZE THE WORKFLOW
+
+final_rf <- finalize_model(
+  tune_spec,
+  best_rmse1
+)
+
+final_rf
+
+final_wf <- workflow() %>%
+  add_recipe(recipe(P_mgkg ~ ., data = P.Predictors)) %>%
+  add_model(final_rf)
+
+###
+#FIT THE MODEL BASED ON TRAINING DATA
+rf_fit <- final_wf %>%
+  fit(P.Predictors)
+rf_fit
+
+#Save the final model 
+saveRDS(rf_fit, paste0(dir.output, model.input, "_RF_model_LIMITED_less1000)corREDUCED_030326.rds"))
+
+```
+
+#### c. Check RF Model Performance
+
+```{r}
+#Predict on the independent test set
+pred_test <- predict(rf_fit, new_data = test.prep)
+pred_test 
+                    
+Test_predictions<-cbind(test.prep, pred_test)
+names(Test_predictions)
+
+#Calculate R-squared
+rsq_test <- Test_predictions %>%
+  rsq(truth = P_mgkg, estimate = .pred)
+
+print(rsq_test)
+
+rmse <- with(Test_predictions, sqrt(mean((P_mgkg - .pred)^2)))
+print(rmse)
+
+#Scatter plot: actual vs predicted
+test.plot<-ggplot(Test_predictions, aes(x = P_mgkg, y = .pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed")+
+  geom_smooth(method="lm", color="black", se=FALSE)+
+  labs(
+    x = "Observed soil TP (mg/kg)",
+    y = "Predicted soil TP (mg/kg)",
+    title = paste0("XGBoost Predictions (R² = ", round(rsq_test$.estimate, 3), ")")
+  ) +
+  theme_minimal()+
+  xlim(0, 1500)+
+  ylim(0,1500)
+test.plot 
+
+#Save to plot to file
+png(paste0(file.name=dir.figures, "/Fig_pred_vs_obs_xgboost_reduced_with_WS_included.png"), width = 4, height = 4, units="in", res = 300)    
+
+grid.newpage() 
+print(test.plot) 
+
+dev.off() 
+
+
+#Check for samples with P<1000
+rsq_test.less1000 <- Test_predictions %>% filter(P_mgkg<1000) %>%
+  rsq(truth = P_mgkg, estimate = .pred)
+rsq_test.less1000
+
+rmse.less1000<-Test_predictions %>% 
+    filter(P_mgkg<1000) %>% 
+    mutate(rmse=sqrt(mean((P_mgkg - .pred)^2))) %>% 
+    dplyr::select(rmse) %>% distinct()
+rmse.less1000
+
+
+#Plot Test data vs Predicted for samples <1000 mg/kg TP
+ggplot(Test_predictions %>% filter(P_mgkg<1000), aes(x = P_mgkg, y = .pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  geom_smooth(method="lm", color="black", se=FALSE)+
+  labs(
+    x = "Actual P_mgkg",
+    y = "Predicted P_mgkg",
+    title = paste0("XGBoost Predictions (R² = ", round(rsq_test.less1000$.estimate, 3), ")")
+  ) +
+  theme_minimal()+
+  xlim(0,1000)+
+  ylim(0,1000)
+```
+
+#### d. Variable Importance
+
+```{r}
+#Run Model in randomForest
+library(randomForest)
+
+start_time <- Sys.time()
+start_time
+
+#check parameter values
+best_rmse1
+
+set.seed(542863)
+rfP_model <- randomForest(mean.SRP ~ ., data = as.data.frame(P_train_preprocessed), 
+                          mtry = best_rmse1$mtry, ntree=1000, replace = FALSE, #specify mtry and nodesize(same as min_n)
+                          nodesize = best_rmse1$min_n,
+                          keep.forest = TRUE, keep.inbag = TRUE)
+end_time <- Sys.time()
+end_time - start_time
+
+summary(rfP_model)
+
+#SAVE FINAL RANDOM FOREST MODEL!
+saveRDS(rfP_model, "./FINALMODEL_randomForest_latesummer.rds")
+
+#LOAD IN MODEL (if needed)
+rfP_model<-readRDS("./FINALMODEL_randomForest_latesummer.rds")
+
+print(rfP_model)
+names(rfP_model)
+
+rfP_model$mtry
+
+#Check performance of the model (should match performance of the random_Forest() model tuned above, using tidymodels?)
+rf.pred<-predict(rfP_model, newdata=P_test_preprocessed)
+head(rf.pred)
+
+#Match actual to predicted data:
+predicted.P<-cbind(as.data.frame(P_test_preprocessed), rf.pred)
+head(predicted.P)
+
+#actual vs predicted
+reg.check<-with(predicted.P, lm(mean.SRP~rf.pred))
+summary(reg.check)
+#calculate rmse
+RMSE = mean((predicted.P$mean.SRP - predicted.P$rf.pred)^2) %>% sqrt()
+RMSE
+
+names(predicted.P)
+names(P.Predictors)
+
+
+##RUN CONDITIONAL PERMUTATION IMPORTANCE:
+#read in saved model if needed;
+setwd(output_dir)
+rfP_model<-readRDS("./FINALMODEL_randomforest_latesummer.rds")
+rfP_model
+
+#Note: permimp does require training data to run!
+
+start_time <- Sys.time()
+start_time
+
+CPI_permimpRF <- permimp(rfP_model, 
+                         conditional = TRUE, progressBar = TRUE, do_check=FALSE)
+
+CPI_permimpRF
+end_time <- Sys.time()
+end_time - start_time #took 14 minutes
+
+#save permimp object!
+saveRDS(CPI_permimpRF, "./permimp_results_latesummer.rds")
+
+
+#read in permimp results if needed
+CPI_permimpRF<-readRDS("./permimp_results_latesummer.rds")
+
+
+#Rank importance values and plot a subset:
+#Make a dot plot:
+#library(dplyr)
+#library(ggplot2)
+VarImp<-as.data.frame(sort(CPI_permimpRF$values, decreasing=TRUE), optional=T)
+colnames(VarImp)[1]<-"Imp"
+rownames(VarImp)
+VarImp2 <- cbind(rownames(VarImp), data.frame(VarImp, row.names=NULL))
+colnames(VarImp2)[1]<-"Var"
+head(VarImp2)
+View(VarImp)
+VarImp2[1:75,]
+```
+
+## 7.2 XGBoost
+
+### a. Tune XGBoost Model
+
+Helpful resources:
+
+<https://juliasilge.com/blog/xgboost-tune-volleyball/>
+
+Note that grid_space_filling() is the newer preferred way to create space-filling hyperparameter grids, it uses a latin hypercube by default
+
+XGBoost model is based on trees - don’t need much preprocessing for our data, ie don’t need to worry about factors or centering or scaling our data. Can just go straight to setting up our model specification.
+
+Note that in tidy models, "xgboost does not have a means to translate factor predictors to grouped slplits. Factor/categorical predictors need to be converted to numeric values (dummy or indicator variables) for this engine. When using the formula via fit.model_spec(), parsnip will convert factor columns to indicators using a one-hot encoding"
+
+Citation:<https://parsnip.tidymodels.org/reference/details_boost_tree_xgboost.html>
+
+```{r}
+
+#Specify model type and hyperparameters to tune 
+
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), ## first three: model complexity
+  sample_size = tune(), mtry = tune(),  ## randomness
+  learn_rate = tune()                   ## step size
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+xgb_spec
+```
+
+Because there are a lot of hyperparameters to tune, reduce computational complexity by setting up possible values for hyperparameters that cover the hyperparameter space.
+
+Note on setting the size of the search space: \~ 10 observations per parameter being tuned are needed to adequately cover the search space - **need a citation for this!**
+
+Here we are tuning 6 parameters (`tree_depth`, `min_n`, `loss_reduction`, `sample_prop`, `mtry`, `learn_rate`)
+
+Recommended Size: 6 x 10 = 60. We will search 80 just to be extra safe. (Tho note this will substantially increase computational time!)
+
+```{r}
+
+#NEW WAY 
+#Set up hyperparameter space to search 
+
+set.seed(123)
+xgb_grid <- grid_space_filling(
+  parameters(
+    tree_depth(),
+    min_n(),
+    loss_reduction(),
+    sample_prop(),
+    finalize(mtry(), P.Predictors),
+    learn_rate()
+  ),
+  size = 60
+)
+
+xgb_grid
+```
+
+Put model into a workflow
+
+```{r}
+
+#Original:
+#xgb_wf <- workflow() %>%
+#  add_formula(P_mgkg ~ .) %>%
+#  add_model(xgb_spec)
+
+#xgb_wf
+
+#With recipe (for use with shapviz later): 
+
+P_recipe <- P.Predictors %>%
+ recipe(P_mgkg ~ .) %>% 
+ #step_integer(all_nominal()) #integer encode factors
+ step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+#Model workflow:
+xgb_wf <- workflow() %>%
+  add_recipe(P_recipe) %>%
+  add_model(xgb_spec)
+
+
+```
+
+Create cross validation resamples for tuning
+
+```{r}
+set.seed(123)
+P_folds <- vfold_cv(P.Predictors, strata = P_mgkg)
+
+P_folds
+```
+
+Tune model:
+
+-Update: takes \~1-2 hours for full USGS/USDA soil P database, 30 min for IL streambank samples, for a search space of 30 and full variables
+
+-Update 2: for a reduced dataset (dropping co-linear variables), and a larger search space (n=80), takes about 13-24 minutes for IL streambank samples
+
+Note for small datasets: The following warning might arise if a dataset is so small that trees can't split according to the hyperparameter values in parameter space: 'A correlation computation is required, but 'estimate' is constant and has 0 standard deviation, resulting in a divide by 0 error. 'NA' will be returned'
+
+See below for a possible alternative solution for small datasets (Bayesian tuning)
+
+```{r}
+
+#Read in training data (if not already loaded above)
+#P.Predictors<-read.csv(paste0(dir.output, model.input, "_train_imputed.csv"), sep=",")
+#names(P.Predictors)
+nrow(P.Predictors) 
+
+#Tune model: 
+start.time<-Sys.time()
+start.time
+
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = P_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE, verbose=TRUE)
+)
+
+xgb_res
+
+end.time<-Sys.time()
+end.time
+
+total.time<-end.time-start.time
+total.time
+```
+
+Explore XGBoost model results:
+
+```{r}
+collect_metrics(xgb_res)
+```
+
+Visualize tuning results:
+
+```{r}
+names(collect_metrics(xgb_res))
+
+View(collect_metrics(xgb_res))
+
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  dplyr::select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "RMSE")
+```
+
+Find best set of parameters:
+
+```{r}
+best_rmse<-show_best(xgb_res, metric="rmse", n=1)
+best_rmse
+
+best_rsq<-show_best(xgb_res, metric="rsq", n=1)
+best_rsq
+```
+
+Finalize tunable workflow with the best parameters:
+
+```{r}
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_rmse
+)
+
+final_xgb
+```
+
+### b. Save final model object
+
+```{r}
+#set directories for final saved models + data
+
+dir.final.model.data<-paste0(dir.output, "/Final_model_comparisons/Final_train_test_datasets")
+
+dir.final.model<-paste0(dir.output, "/Final_model_comparisons")
+
+#Run the final model:
+set.seed(123)
+final_fit <- final_xgb %>%
+  fit(data = P.Predictors)
+
+# Save the trained model object
+saveRDS(final_fit, file = paste0(dir.final.model, model.input, "_xgb_model_LIMITED_less100_corReduced_stepdummy_03032026.rds"))
+
+```
+
+### c. Load Saved Model (as needed)
+
+And load saved model input and validation data
+
+```{r}
+
+model.input
+
+# Load saved model
+#final_fit <- readRDS(paste0(dir.output, model.input, "_xgb_model_LIMITED_less1000_corReduced_stepdummy_021926.rds"))
+
+final_fit<-readRDS(paste0(dir.output, "/Final_model_comparisons", model.input, "_xgb_model_LIMITED_less1000_corReduced_stepdummy_03032026.rds"))
+
+
+summary(final_fit)
+#summary(final_fit_all)
+
+
+#READ IMPUTED DATA
+dir.final.model.data<-paste0(dir.output, "/Final_model_comparisons/Final_train_test_datasets")
+#(note this is training data only)
+P.Predictors<-read.csv(paste0(dir.final.model.data, model.input, "_train_imputed_less1000_reducedCor_03032026.csv"))
+
+P.Predictors$NLCD_Land<-factor(P.Predictors$NLCD_Land)
+
+#View(P.Predictors)
+
+#(test data)
+test.prep<-read.csv(paste0(dir.final.model.data, model.input, "_TEST_imputed_less1000_reduced_Cor_03032026.csv"))
+
+test.prep$NLCD_Land<-factor(test.prep$NLCD_Land)
+
+#View(test.prep)
+
+#SET ATTRIBUTE TYPES
+#Set categorical attributes to factor
+cat_vars <- names(P.Predictors)[sapply(P.Predictors, function(x) is.factor(x) | is.character(x))]
+cat_vars
+
+P.Predictors<-P.Predictors %>% 
+  mutate(across(cat_vars, as.factor))
+test.prep<-test.prep %>% 
+  mutate(across(cat_vars, as.factor))
+
+#Set remaining numeric attributes to numeric
+dep_var="P_mgkg"
+num_vars <- names(P.Predictors)[sapply(P.Predictors, is.numeric) & names(P.Predictors) != dep_var]
+num_vars
+
+P.Predictors <- P.Predictors %>%
+  mutate(across(num_vars, as.numeric))
+test.prep<-test.prep %>% 
+  mutate(across(num_vars, as.numeric))
+
+sapply(P.Predictors, class)
+```
+
+### d. Check model hyperparameters
+
+```{r}
+
+#Different approaches for examing hyperparameter values:
+
+print(final_fit) 
+
+xgb_engine_fit <- extract_fit_engine(final_fit)
+
+print(xgb_engine_fit$params)
+
+```
+
+### e. Variable importance: XGBoost
+
+#### i. Built in variable importance for XGBoost
+
+Based on "Gain" - the improvement in accuracy (loss reduction) brought by a feature to the branches it is used in.It measures how much each feature contributes to the model's predictive power, with higher values indicating more important features. Can also evaluate based on Cover or Frequency
+
+```{r}
+
+#use vip() to automatically plot importance:
+
+final_fit %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point", num_features = 10)+
+  theme_bw()+
+  theme(panel.grid=element_blank())+
+  #scale_y_discrete(labels = my_labels)+
+  xlab("Variable Importance")
+
+
+#A more adjustable plot:
+
+
+#extract model first 
+
+xgb_booster_object <- extract_fit_engine(final_fit)  
+
+#importance measures
+importance <- xgb.importance(model = xgb_booster_object) 
+
+importance
+
+#ID top 10 most important predictors 
+top_vars <- importance$Feature[1:10] 
+top_vars 
+
+#make nicer labels
+#Cat scale predictors only:
+labels = list(
+  "Water input",
+  "% Glacial till, loamy (watershed)",
+  "Soil erodibility factor",
+  "Depth (cm)",
+  "% Glacial till, loamy (catchment)",
+  "WWTP density",
+  "% Ag drainage",
+  "% Hay",
+  "Hydraulic conductivity",
+  "% Mixed forest"
+              
+            #"Net anthropogenic N inputs",
+             # "Annual min air temp, 1981-2010",
+              #"Mean topographic wetness index",
+              #"Sediment regulation index",
+              #"Elevation",
+              #"Slope Length - USLE",
+              #"Population density",
+              #"Soil organic carbon, 100-150cm"
+)
+
+#Watershed and Cat scale predictors:
+labels = list("Depth",
+              "Water input",
+              "WWTP density",
+              "Mean annual precip",
+              "% ag on high slopes",
+              "Elevation",
+              "% Glacial till, loamy",
+              "Soil erodibility",
+              "N from rock weathering",
+              "Water withdrawals"
+              )
+
+
+#select top 10 by gain and assign better labels
+imp.data<-importance %>% 
+  arrange(desc(as.numeric(Gain))) %>% 
+   slice_max(Gain, n = 10)
+
+imp.data$labels<-as.character(labels)
+imp.data
+
+
+#Make nicer plot: 
+imp.plot<-ggplot(imp.data)+
+  geom_point(aes(x=Gain, y = reorder(labels, Gain)), size=3)+
+  theme_bw()+
+  theme(panel.grid=element_blank(), axis.text=element_text(size=16), axis.title=element_text(size=18))+
+  #scale_y_discrete(labels = my_labels)+
+  xlab("Variable Importance")+
+  ylab("Model Predictors")
+imp.plot
+
+#save plot to file
+
+png(paste0(file.name=dir.figures, "/Fig_streambank_importance_plot_WSincluded_corReduced_less1000.png"), width = 2900, height = 1800, res = 300)    
+
+grid.newpage() 
+print(imp.plot) 
+
+dev.off()  
+```
+
+#### ii. Shapley Importance Values
+
+There are multiple packages/approaches for illustrating SHAP values:
+
+1.  shapviz
+2.  SHAPforxgboost
+3.  xgboost has a native shap function (xgb.plot.shap)
+
+```{r}
+
+#####################################
+#1. Using shapviz method
+#install.packages("shapviz")
+library(shapviz)
+
+
+#Recall P recipe
+P_recipe <- P.Predictors %>%
+ recipe(P_mgkg ~ .) %>% 
+ #step_integer(all_nominal()) #integer encode factors
+ step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+
+# The 'X_pred' argument in shapviz() is prepared predictor matrix
+set.seed(123)
+shap <- shapviz(extract_fit_engine(final_fit), 
+                X_pred = bake(
+      prep(P_recipe),
+      has_role("predictor"),
+      new_data = NULL,
+      composition = "matrix"
+    )
+  )
+shap
+
+View(shap)
+
+#Importance plot for top predictors: 
+sv_importance(shap, kind = "beeswarm", show_numbers = TRUE, max_display=15)
+
+#Importance plot for all features for Appendix:
+shap.plot.all<-sv_importance(shap, kind = "beeswarm", show_numbers = TRUE, max_display=Inf, number_size=5)+
+  theme(axis.text=element_text(size=16), legend.text=element_text(size=16), legend.title=element_text(size=16))
+shap.plot.all
+#save plot to file
+
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_1_WSincluded_corReduced_less1000_02252026_ALL_FEATURES.png"), width = 4000, height = 6000, res = 300)    
+
+grid.newpage() 
+shap.plot.all
+dev.off() 
+
+
+
+
+#top 10 features with nicer labels:
+shap.plot1<-sv_importance(shap, kind = "beeswarm", show_numbers = TRUE, max_display=10)+
+  scale_y_discrete(labels = c(
+    "waterinputcat" = "Water input",
+    "pctglactilloamws"= "% Glacial till, loamy (watershed)",
+    "kffactws" = "Soil erodibility factor",
+    "Depth_cm" = "Depth (cm)",
+    "hydricrating_No" = "Not hydric soils",
+    "wwtpmajordensws" = "WWTP density",
+    "pctglactilloamcat" = "% Glacial till, loamy (catchment)",
+  
+  "tk100_150s" = "Soil thickness, 100-150cm",
+  "rocknws" = "N from rock weathering", 
+  "pcthay2011ws" = "% Hay",
+  "popden2010ws" = "Population density",
+  "precip2009ws" = "Mean annual precipitation (mm) ",
+  "omws" = "Organic matter"))+
+  theme_bw()
+shap.plot1
+
+
+
+#save plot to file
+
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_1_WSincluded_corReduced_less1000_02252026.png"), width = 2200, height = 1400, res = 300)    
+
+grid.newpage() 
+shap.plot1
+dev.off()  
+
+
+#Dependency plots using shapviz:
+
+#For a specific variable:
+   
+
+plot1<-sv_dependence(shap, v="waterinputcat", share_y=TRUE, color_var=NULL)+xlab("Water input")
+
+plot2<-sv_dependence(shap, v="pctglactilloamws", share_y=TRUE, color_var=NULL)+xlab("% Glacial till, loamy \n (watershed)")
+  
+plot3<-sv_dependence(shap, v="Depth_cm", share_y=TRUE, color_var=NULL)+xlab("Depth (cm)")
+
+plot4<-sv_dependence(shap, v="kffactws", share_y=TRUE, color_var=NULL)+xlab("Soil erodibility")
+
+
+plot5<-sv_dependence(shap, v="pctglactilloamcat", share_y=TRUE, color_var=NULL)+xlab("% Glacial till, loamy \n (catchment)")
+ 
+
+plot6<-sv_dependence(shap, v="hydricrating_No", share_y=TRUE, color_var=NULL)+ xlab("Not hydric soils")
+
+#for some reason, this plot coming out incorrectly (are no negative values for wwtpmajordensws)
+#plot5<-sv_dependence(shap, v="wwtpmajordensws", share_y=TRUE, color_var=NULL)+xlab("WWTP density")
+summary(P.Predictors$wwtpmajordensws)
+#plotting manually:
+sv_dependence(shap, v="wwtpmajordensws", share_y=TRUE)
+
+wwtp.shap.data<-as.data.frame(shap[["S"]]) %>% dplyr::select(wwtpmajordensws)
+head(wwtp.shap.data)
+
+og.data<-as.data.frame(shap[["X"]][["wwtpmajordensws"]])
+head(og.data)
+colnames(og.data)[1]<-"WWTP_dens"
+
+wwtp.shap<-cbind(wwtp.shap.data, og.data)
+
+plot7<-ggplot(wwtp.shap)+
+  geom_point(aes(WWTP_dens, wwtpmajordensws), col="#3b528b")+
+  xlab("WWTP density")+
+  ylab("SHAP value")
+plot7
+
+
+plot8<-sv_dependence(shap, v="precip2009ws", share_y=TRUE, color_var=NULL)+xlab("Mean Precipitation (mm)")
+
+plot9<-sv_dependence(shap, v="omws", share_y=TRUE, color_var=NULL)+xlab ("Organic Matter")
+
+plot10<-sv_dependence(shap, v = "rocknws", share_y = TRUE, color_var=NULL)+ xlab("N from rock weathering")
+
+
+library(gridExtra)
+
+grid.newpage() 
+shap.plot1
+dev.off()  
+grid.arrange(plot1,
+plot2,
+plot3,
+plot4,
+plot5,
+plot6,
+plot7,
+plot8,
+plot9,
+plot10, nrow=5, ncol=2)
+
+#save plot to file 
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_dependency_WSincluded_corReduced_less1000_02252026.png"), width = 1400, height = 3000, res = 300)    
+
+grid.arrange(plot1,
+plot2,
+plot3,
+plot4,
+plot5,
+plot6,
+plot7,
+plot8,
+plot9,
+plot10, nrow=5, ncol=2)
+
+dev.off()
+
+##
+#Other plot types:
+
+sv_force(shap, row_id = 1)
+sv_waterfall(shap, row_id = 1)
+
+#####################################
+#2. Using SHAPforxgboost method
+#(produces same results as above)
+
+library(SHAPforxgboost)
+
+game_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(final_fit),
+    X_train = bake(
+      prep(P_recipe),
+      has_role("predictor"),
+      new_data = NULL,
+      composition = "matrix"
+    )
+  )
+
+shap.plot2<-shap.plot.summary(game_shap) #this shows SHAP values for all predictors 
+shap.plot2
+
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_2+WSincluded_corReduced_less1000.png"), width = 1800, height = 2900, res = 300)    
+grid.newpage() 
+shap.plot2
+dev.off()  
+
+##################################
+#3. Using native xgboost method 
+
+#One dependency plot for all top variables of interest
+#**Note: this is showing slightly different variable importance order than previous two methods! **
+
+xgb.plot.shap(data = bake(
+      prep(P_recipe),
+      has_role("predictor"),
+      new_data = NULL,
+      composition = "matrix"
+    ), 
+    model = extract_fit_engine(final_fit), top_n = 5)          
+             
+#save plot to file
+
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_3_WSincluded_corReduced_less1000.png"), width = 1800, height = 2900, res = 300)    
+
+grid.newpage() 
+xgb.plot.shap(data = bake(
+      prep(P_recipe),
+      has_role("predictor"),
+      new_data = NULL,
+      composition = "matrix"
+    ), 
+    model = extract_fit_engine(final_fit), top_n = 15)  
+dev.off()  
+
+
+```
+
+### f. Partial dependence plots:
+
+Use DALEX for partial dependence plots when using tidymodels
+
+Example: <https://juliasilge.com/blog/mario-kart/>
+
+```{r}
+#Use a model_explainer from DALEXtra to create partial dependence plots:  
+model_explainer <- explain_tidymodels(   
+  final_fit,   
+  data = dplyr::select(P.Predictors, -P_mgkg),   
+  y = P.Predictors$P_mgkg,   
+  verbose = FALSE )  
+
+#Plot PDP plots for top 10 most important variables:  
+pdp_time <- model_profile(   
+  model_explainer,   
+  variables = top_vars,   
+  N = NULL )  
+
+plot(pdp_time)
+```
+
+Make fancier Partial Dependence Plots for manuscript:
+
+```{r}
+
+#Needs: variables in correct order
+#be able to control plot aesthetics 
+
+names(pdp_time)
+
+#look at top 10 most important predictors:
+top_vars
+
+#Extract relationship between variables and predicted dependent variable:
+
+PDP<-as.data.frame(pdp_time$agr_profiles)
+names(PDP)
+
+#Remove funky formatting and 
+#Select top 10 variables:
+PDP.sel<-PDP %>% 
+  rename_with(~ str_remove_all(.x, "^_|_$"))%>% 
+  filter(vname %in% top_vars)
+
+#Make nicer labels for predictors and put them in right order: 
+PDP.sel$PDP.label<-factor(PDP.sel$vname, levels=top_vars, labels=labels)
+head(PDP.sel)
+
+#Plot using ggplot: 
+
+PDP.Plot<-ggplot(PDP.sel, aes(x = x, y = yhat)) +
+  geom_line(color = "blue", linewidth = 1.2) + # Change line style here
+  facet_wrap(~ PDP.label, scales = "free_x", ncol = 4, labeller = label_wrap_gen(width = 20)) + # 'free_x' allows different units; wrap strip text
+  labs(
+    y = "Predicted P (mg/kg)",
+    x = "Predictor Value",
+    title = "Partial Dependence Plots"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "gray95"), # Box behind variable names
+    strip.text = element_text(face = "bold", size = 10)
+  )
+PDP.Plot
+
+
+#save plot to file
+
+png(paste0(file.name=dir.figures, "/Fig_PDP_plot_streambank_WS_included_corReduced_less1000.png"), width = 2000, height = 2000, res = 300)    
+grid.newpage() 
+print(PDP.Plot) 
+
+dev.off()  
+
+```
+
+### g. Model Performance: Independent validation data
+
+Fit model to test data and evaluate accuracy
+
+```{r}
+
+#Predict on the independent test set
+pred_test <- predict(final_fit, new_data = test.prep)
+pred_test 
+                    
+Test_predictions<-cbind(test.prep, pred_test)
+names(Test_predictions)
+
+#Calculate R-squared
+rsq_test <- Test_predictions %>%
+  rsq(truth = P_mgkg, estimate = .pred)
+
+print(rsq_test)
+
+rmse <- with(Test_predictions, sqrt(mean((P_mgkg - .pred)^2)))
+print(rmse)
+
+#Scatter plot: actual vs predicted
+test.plot<-ggplot(Test_predictions, aes(x = P_mgkg, y = .pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed")+
+  geom_smooth(method="lm", color="black", se=FALSE)+
+  labs(
+    title = paste0("XGBoost Predictions (R² = ", round(rsq_test$.estimate, 2), ")")
+  ) +
+  xlab(bquote(Observed~soil~TP~(mg~kg^-1)))+
+  ylab(bquote(Predicted~soil~TP~(mg~kg^-1)))+
+  theme_minimal()+
+  xlim(0, 1000)+
+  ylim(0,1000)
+test.plot 
+
+#Save to plot to file
+png(paste0(file.name=dir.figures, "/Fig_pred_vs_obs_xgboost_reduced_with_WS_included_less1000_reducedcor_03022026.png"), width = 4, height = 4, units="in", res = 300)    
+
+grid.newpage() 
+print(test.plot) 
+
+dev.off() 
+
+
+#Check for samples with P<1000
+rsq_test.less1000 <- Test_predictions %>% filter(P_mgkg<1000) %>%
+  rsq(truth = P_mgkg, estimate = .pred)
+rsq_test.less1000
+
+rmse.less1000<-Test_predictions %>% 
+    filter(P_mgkg<1000) %>% 
+    mutate(rmse=sqrt(mean((P_mgkg - .pred)^2))) %>% 
+    dplyr::select(rmse) %>% distinct()
+rmse.less1000
+
+
+#Plot Test data vs Predicted for samples <1000 mg/kg TP
+ggplot(Test_predictions %>% filter(P_mgkg<1000), aes(x = P_mgkg, y = .pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  geom_smooth(method="lm", color="black", se=FALSE)+
+  labs(
+    x = "Actual P_mgkg",
+    y = "Predicted P_mgkg",
+    title = paste0("XGBoost Predictions (R² = ", round(rsq_test.less1000$.estimate, 3), ")")
+  ) +
+  theme_minimal()+
+  xlim(0,1000)+
+  ylim(0,1000)
+
+
+```
+
+### h. Alternative tuning method for small datasets - try a Bayesian tuning approach
+
+Define search space with safer bounds for small dataset:
+
+```{r}
+param_set <- parameters(   
+  tree_depth(range = c(2L, 6L)),   
+  min_n(range = c(2L, 20L)),   
+  loss_reduction(range = c(0, 5)),   # gamma, no negative   
+  sample_size = sample_prop(range = c(0.6, 1.0)),   
+  finalize(mtry(), P.Predictors),   
+  learn_rate(range = c(0.01, 0.3)) )
+```
+
+Bayesian tuning:
+
+Start with some random trials (`initial`) and then let Bayesian optimization adapt:
+
+Note: this is slow, even for a small dataset
+
+```{r}
+set.seed(345) 
+xgb_bayes <- tune_bayes(   
+  xgb_wf,   
+  resamples = P_folds,   
+  param_info = param_set,   
+  metrics = metric_set(rmse, mae),   
+  initial = 10, # initial random search   
+  iter = 20, # number of Bayesian iterations   
+  control = control_bayes(verbose = TRUE, no_improve = 10, 
+  save_pred=TRUE) )
+```
+
+Plot tuning improvements over iterations
+
+```{r}
+bayes_results <- xgb_bayes %>% collect_metrics() bayes_params <- xgb_bayes %>% collect_predictions()  xgb_bayes %>% 
+  show_best(metric = "rmse", n = 20) 
+# top-performing iterations  
+
+# Plot RMSE over iterations 
+bayes_results %>%   
+  filter(.metric == "rmse") %>%   
+  mutate(iter = 1:n()) %>%  # iteration order   
+  
+  ggplot(aes(x = iter, y = mean)) +   
+  geom_point(color = "blue") +   
+  geom_line(color = "darkblue") +   
+  labs(     
+    x = "Iteration",     
+    y = "Mean RMSE",     
+    title = "Bayesian Optimization Progress"   ) +   
+  theme_minimal()
+```
+
+Pick best model:
+
+```{r}
+best_bayes <- select_best(xgb_bayes, metric = "rmse")
+best_bayes 
+
+final_xgb <- finalize_workflow(xgb_wf, best_bayes)  
+
+final_fit <- fit(final_xgb, data = P.Predictors)
+
+library(vip)  
+final_fit %>%   
+  extract_fit_engine() %>%   
+  vip(geom = "point")
+```
+
+# 8 Run Model on Additional Test Datasets
+
+Steps:
+
+-   Match predictor variables of new dataset to model dataset
+
+    -   Values for predictors should be within range of model dataset
+
+-   Impute missing values for new dataset, using model dataset to help inform
+
+-   Run new dataset through the model
+
+-   Plot linear relationship
+
+## 8.1 Load additional data you'd like to test
+
+```{r}
+
+#1. Name additional dataset(s) you'd like to test:
+
+new.test.input<-"/Margenot_sample_attributes" #Margenot IL data
+
+#2. Load data:
+
+list.files(dir.output)
+
+new.test.data<-read.csv(paste0(dir.output, new.test.input, '_for_modelling_wSSURGO_LIMITED.csv'))
+head(new.test.data)
+nrow(new.test.data)
+
+sort(names(new.test.data))
+
+```
+
+## 8.2 Load model you wish to use to predict values for new dataset 
+
+```{r}
+
+#set directory for final saved models
+dir.final.model<-paste0(dir.output, "/Final_model_comparisons")
+
+#specify which model
+model.input<-"/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED"
+
+#read in model
+
+final_fit<-readRDS(paste0(dir.output, "/Final_model_comparisons", model.input, "_xgb_model_LIMITED_less1000_corReduced_stepdummy_03032026.rds"))
+
+```
+
+## 8.3 Make sure predictors in new dataset match predictors in the model
+
+```{r}
+#3. Make sure predictor columns of new data match predictor columns of data used to build the model
+
+#set directory for final train/test datasets
+dir.final.model.data<-paste0(dir.output, "/Final_model_comparisons/Final_train_test_datasets")
+
+
+
+#Read in desired predictor dataset
+
+P.Predictors<-read.csv(paste0(dir.final.model.data, model.input, "_train_imputed_less1000_reducedCor_03032026.csv"))
+
+names(P.Predictors)
+
+new.test.data2<-new.test.data %>%
+  { if ("meanP_mgkg" %in% names(.)) rename(., P_mgkg = meanP_mgkg) else . } %>% #rename P column if took average of subsamples
+  dplyr::select(any_of(names(P.Predictors))) #grab all columns that match P.Predictors 
+
+names(new.test.data2)
+
+#Do all columns match?
+all(sort(names(new.test.data2)) == sort(names(P.Predictors))) # should be TRUE
+
+#just in case, find missing columns:
+setdiff(names(P.Predictors), names(new.test.data2))
+
+setdiff(names(new.test.data2), names(P.Predictors))
+
+
+names(new.test.data2)
+
+```
+
+## 8.4 Restrict data to samples with TP \< 1000 mg/kg (Optional)
+
+```{r}
+
+new.test.data2<-new.test.data2 %>% 
+  filter(P_mgkg<1000)
+```
+
+## 8.5 Impute missing values for new data
+
+```{r}
+#4. Impute missing values separately
+#Combine with predictor attributes to have more data to impute missing values
+
+dataImputed<-P.Predictors %>% 
+  dplyr::select(-P_mgkg)
+names(dataImputed)
+
+
+NEW.Test.impute<-rbind(
+  (new.test.data2 %>% 
+    dplyr::select(-any_of(c("P_mgkg", "meanBD_gcm3")))),
+dataImputed)
+nrow(NEW.Test.impute)
+
+start_time <- Sys.time()
+start_time
+NEW.data.Test.Imputed <- missRanger(NEW.Test.impute,
+                                formula = . ~ . ,
+                                num.trees = 100, 
+                                verbose = 1, seed = 111)
+
+end_time <- Sys.time()
+end_time - start_time
+
+#select out test data; and attach to soil P
+NEW.test<-NEW.data.Test.Imputed[c(1:nrow(new.test.data2)),]
+NEW.P<-new.test.data2 %>% dplyr::select(P_mgkg)
+NEW.P
+NEW.DATA<-cbind(NEW.P, NEW.test)
+nrow(NEW.DATA)
+
+
+#View(new.test.data2)
+#View(NEW.test)
+#View(NEW.DATA)
+```
+
+## 8.6 Predict modeled values for the new dataset
+
+```{r}
+# 5. Predict on the independent test set
+NEW.pred_test <- predict(final_fit, new_data = NEW.DATA)
+NEW.pred_test 
+                    
+NEW.Test_predictions<-cbind(NEW.DATA, NEW.pred_test)
+names(NEW.Test_predictions)
+
+
+```
+
+Evaluate prediction performance
+
+```{r}
+# 6. Calculate R-squared
+rsq_test <- NEW.Test_predictions %>%
+  rsq(truth = P_mgkg, estimate = .pred)
+
+print(rsq_test)
+
+# 7. Scatter plot: actual vs predicted
+streambank.test.plot<-ggplot(NEW.Test_predictions, aes(x = P_mgkg, y = .pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed")+
+  geom_smooth(method="lm", color="black", se=FALSE)+
+  labs(
+    title = paste0("XGBoost Predictions (R² = ", round(rsq_test$.estimate, 2), ")")
+  ) +
+  xlab(bquote(Observed~soil~TP~(mg~kg^-1)))+
+  ylab(bquote(Predicted~soil~TP~(mg~kg^-1)))+
+  theme_minimal()+
+  xlim(0,1000)+
+  ylim(0,1000)
+streambank.test.plot
+
+#Check for samples with P<1000
+rsq_test.less1000 <- NEW.Test_predictions %>% filter(P_mgkg<1000) %>%
+  rsq(truth = P_mgkg, estimate = .pred)
+rsq_test.less1000
+
+
+ggplot(NEW.Test_predictions %>% filter(P_mgkg<1000), aes(x = P_mgkg, y = .pred)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  geom_smooth(method="lm", color="black", se=FALSE)+
+  labs(
+    x = "Actual streambank TP (mgkg)",
+    y = "Predicted streambank TP (mg/kg)",
+    title = paste0("XGBoost Predictions (R² = ", round(rsq_test.less1000$.estimate, 2), ")")
+  ) +
+  theme_minimal()
+
+
+#Save to plot to file
+png(paste0(file.name=dir.figures, "/Fig_pred_vs_obs_soilTP_xgboost_reduced_with_WS_included_less1000_reducedcor_021126_STREAMBANK_PREDICTED.png"), width = 4, height = 4, units="in", res = 300)    
+
+grid.newpage() 
+print(streambank.test.plot) 
+
+dev.off() 
+```
