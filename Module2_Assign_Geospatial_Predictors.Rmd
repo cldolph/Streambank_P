@@ -41,7 +41,7 @@ For appending to names of saved files below (this is only needed for streambank 
 
 ```{r}
 #For streambank samples:
-dataset<-'/Margenot_'
+#dataset<-'/Margenot_'
 
 #For historic samples: 
 #dataset<-'/Margenot_PEDON'
@@ -540,11 +540,11 @@ Load sample points with all attributes attached so far:
 #set P sample file input name:
 
 #For streambank and historic P samples
-file.input<-paste0(dataset, "sample_attributes")
-file.input
+#file.input<-paste0(dataset, "sample_attributes")
+#file.input
 
 #For soil P database:
-#file.input<-"/USGS_NCSS_soils_database_attributes_alldepths"
+file.input<-"/USGS_NCSS_soils_database_attributes_alldepths"
 
 #Read in data:
 P.att<-read.csv(paste0(dir.output, file.input, '.csv'))
@@ -580,6 +580,11 @@ Some additional metadata on new Streamcat attributes: <https://pasteur.epa.gov/u
 All.Streamcat<-sc_get_params(param="metric_names")
 All.Streamcat
 
+#View(as.data.frame(All.Streamcat))
+
+#Get all variable descriptions!!
+Definitions<-sc_get_params(param='variable_info')
+View(Definitions)
 
 #Subset the Streamcat attributes you want to use
 #eliminate fire related, containing "burn", "sev", "fire", "procmask"
@@ -628,7 +633,7 @@ comid_chunks
 
 sc_data_list <- lapply(comid_chunks, function(chunk) {
   comid.list <- paste0(chunk, collapse = ",")
-  sc_get_data(metric = metric.list, aoi = "cat,ws", comid = comid.list)
+  sc_get_data(metric = metric.list, aoi = "cat,ws", comid = comid.list, showAreaSqKm=TRUE)
 })
 
 
@@ -640,6 +645,11 @@ head(sc_data)
 names(sc_data)
 View(sc_data)
 nrow(sc_data) #Note that some values were dropped - these may be sink catchments (not associated with NHD flowline)
+
+#Average catchment area for study region:
+sc_data %>% dplyr::select(catareasqkm, wsareasqkm) %>% summarise(mean.catchment.area=mean(catareasqkm), median.catchment.area=median(catareasqkm), mean.ws.area=mean(wsareasqkm), median.ws.area=median(wsareasqkm))
+
+
 
 ```
 
