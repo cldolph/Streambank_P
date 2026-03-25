@@ -18,7 +18,7 @@ rm(list=ls())
 
 
 #list of necessary packages 
-want <- c('data.table', 'xgboost', 'caret', 'dplyr', 'ggplot2', 'scales', 'tidymodels', 'missRanger', 'doParallel', 'DALEXtra', 'vip', 'grid', 'stringr')
+want <- c('tidyverse', 'data.table', 'xgboost', 'caret', 'dplyr', 'ggplot2', 'scales', 'tidymodels', 'missRanger', 'doParallel', 'DALEXtra', 'vip', 'grid', 'stringr')
 
 need <- want[!(want %in% installed.packages()[,"Package"])]
 if (length(need)) install.packages(need)
@@ -39,6 +39,12 @@ dir.output<-paste0(dir.root, "/output_data")
 
 dir.figures<-paste0(dir.root, '/Maps_figures')
 
+#set directories for final saved models + data
+
+dir.final.model.data<-paste0(dir.output, "/Final_model_comparisons/Final_train_test_datasets")
+
+dir.final.model<-paste0(dir.output, "/Final_model_comparisons")
+
 ```
 
 # 2 Load the dataset
@@ -48,14 +54,14 @@ dir.figures<-paste0(dir.root, '/Maps_figures')
 #Select the input data you'd like to use: 
 
 #Margenot et al IL streambank P data, with limited ssurgo attributes to retain all data, for independent streambank model or for running through existing soil TP model (predictors are matched below): 
-model.input<-"/Margenot_sample_attributes_for_modelling_wSSURGO_LIMITED"
+#model.input<-"/Margenot_sample_attributes_for_modelling_wSSURGO_LIMITED"
 
 
 #Modern upland Soil P database:
 #model.input<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling'
 
 #Modern upland soil P database but with limited ssurgo attributes that should encompass water areas?
-#model.input<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED'
+model.input<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED'
 
 P_dataset <-read.csv(paste0(dir.output, model.input, '.csv'))
                     
@@ -82,6 +88,41 @@ sapply(P_dataset, class)
 #NOTE: need to fix this later! (not working)
 P_dataset<-P_dataset %>%
   { if ("meanP_mgkg" %in% names(.)) rename(., P_mgkg = meanP_mgkg) else . }
+```
+
+## 2.1 Option to add pH and other site-specific data for streambank samples
+
+```{r}
+
+ph<-readxl::read_excel(paste0(dir.data, "/Margenot streambank soil data to Christy Dolph_01202026_wpH.xlsx"))
+nrow(ph)
+#match pH to existing attributes based on lat long
+
+names(P_dataset)
+names(ph)
+
+#Clean up columns
+ph.clean<-ph %>% 
+  separate_wider_delim(cols = 'Depth (cm)', delim = "-", names = c("Depth_min_cm", "Depth_max_cm"),cols_remove = FALSE, too_few="debug") %>%
+  dplyr::rename(x=Long, y=Lat, pct.sand=`%Sand`, pct.silt=`%Silt`, pct.clay=`%Clay`, Depth_cm=Depth_max_cm) %>% 
+   dplyr::select(x,y,pH,pct.silt, pct.sand, pct.clay, Depth_cm) %>% 
+  na.omit() #drop samples with missing data
+names(ph.clean)
+
+#View(ph.clean)
+nrow(ph.clean)
+
+#View(P_dataset %>% dplyr::select(x,y,P_mgkg, Depth_cm))
+
+class(ph$x)
+class(P_dataset$x)
+
+P_dataset.ph<-merge(P_dataset, ph.clean, by=c('x', 'y', 'Depth_cm'))
+
+nrow(P_dataset.ph) #Note 34 sites were dropped after merge 
+
+#To use pH data:
+P_dataset<-P_dataset.ph
 ```
 
 # 3 Explore the data
@@ -122,6 +163,18 @@ P_dataset %>% filter(P_mgkg>1000) %>% nrow()
 
 ```
 
+Mean P value
+
+```{r}
+
+#Including and excluding samples with P >1000 mg/kg
+
+P_dataset %>% 
+  filter(P_mgkg<1000) %>% 
+  summarise(meanP=mean(P_mgkg))
+
+```
+
 Plot streambank P vs bulk density
 
 ```{r}
@@ -136,7 +189,6 @@ ggplot(P_dataset) +
 ```{r}
 summary(P_dataset)
 class(P_dataset)
-
 
 ```
 
@@ -254,10 +306,15 @@ walk(num_vars, function(num_var) {
 dev.off()
 ```
 
-### c. Manuscript figure (Appendix): Examine relationships among glacial till attributes
+### c. Manuscript figure (Appendix): Examine relationships among parent material: glacial till vs loess
+
+"pcteolfinews" = % of AOI area classified as lithology type: eolian sediment, fine-textured (glacial loess)
 
 ```{r}
-names(P_dataset)
+P_dataset %>% order() %>% names()
+
+P_dataset %>% 
+ select(order(colnames(P_dataset))) %>% names()
 
 #Parent material:
 
@@ -265,6 +322,7 @@ parent<-c("pctglactilclayws",
 "pctglaclakefinews",
 "pctglaclakecrsws",
 "pcteolcrsws",
+"pcteolfinews",
 "pctglactilloamws",
 "pctglactilcrsws",
 "pctalluvcoastws",
@@ -274,6 +332,9 @@ parent<-c("pctglactilclayws",
 "pctglactilclaycat")
 
 soils<-P_dataset %>% dplyr::select(all_of(parent))
+
+ggplot(soils)+
+  geom_point(aes(pctglactilloamws, pcteolfinews))
 
 ggplot(soils)+
   geom_point(aes(pctglactilclayws, pctglactilloamws))
@@ -448,7 +509,7 @@ high_correlations <- cor_matrix_view %>%
 
 #View(high_correlations)
 
-#View(high_correlations %>% filter(Var1=="pctcrop2011ws"|Var1=="pctcrop2011cat"))
+View(high_correlations %>% filter(Var2=="pctglactilloamws"))
 
 #Use findCorrelation() to drop highly correlated variables - 
 #first ID indices of highly correlated predictors
@@ -633,9 +694,9 @@ Write imputed and cleaned data to file
 ```{r}
 #WRITE IMPUTED DATA TO FILE
 #(note this is training data only)
-write.table(P.Predictors, paste0(dir.output, "/Final_model_comparisons", model.input, "_train_imputed_less1000_reducedCor_03032026.csv"), sep=",", row.names=FALSE)
+write.table(P.Predictors, paste0(dir.output, "/Final_model_comparisons", model.input, "_train_imputed_less1000_03252026.csv"), sep=",", row.names=FALSE)
 
-write.table(test.prep, paste0(dir.output, "/Final_model_comparisons", model.input, "_TEST_imputed_less1000_reduced_Cor_03032026.csv"), sep=",", row.names=FALSE)
+write.table(test.prep, paste0(dir.output, "/Final_model_comparisons", model.input, "_TEST_imputed_less1000_03252026.csv"), sep=",", row.names=FALSE)
 
 ```
 
@@ -802,7 +863,7 @@ P_folds <- vfold_cv(P.Predictors)
 #PUT EVERYTHING TOGETHER IN A WORKFLOW
 
 tune_wf <- workflow() %>%
-  add_recipe(P_recipe) %>%
+  add_recipe(P_recipe_RF) %>%
   add_model(tune_spec)
 
 
@@ -870,7 +931,7 @@ rf_fit <- final_wf %>%
 rf_fit
 
 #Save the final model 
-saveRDS(rf_fit, paste0(dir.output, model.input, "_RF_model_LIMITED_less1000)corREDUCED_030326.rds"))
+saveRDS(rf_fit, paste0(dir.output, model.input, "_RF_model_LIMITED_stepdummy_less1000_031326.rds"))
 
 ```
 
@@ -1205,6 +1266,7 @@ Find best set of parameters:
 ```{r}
 best_rmse<-show_best(xgb_res, metric="rmse", n=1)
 best_rmse
+View(best_rmse)
 
 best_rsq<-show_best(xgb_res, metric="rsq", n=1)
 best_rsq
@@ -1236,7 +1298,7 @@ final_fit <- final_xgb %>%
   fit(data = P.Predictors)
 
 # Save the trained model object
-saveRDS(final_fit, file = paste0(dir.final.model, model.input, "_xgb_model_LIMITED_less100_corReduced_stepdummy_03032026.rds"))
+saveRDS(final_fit, file = paste0(dir.final.model, model.input, "_xgb_model_LIMITED_stepdummy_less1000_03252026.rds"))
 
 ```
 
@@ -1251,7 +1313,7 @@ model.input
 # Load saved model
 #final_fit <- readRDS(paste0(dir.output, model.input, "_xgb_model_LIMITED_less1000_corReduced_stepdummy_021926.rds"))
 
-final_fit<-readRDS(paste0(dir.output, "/Final_model_comparisons", model.input, "_xgb_model_LIMITED_less1000_corReduced_stepdummy_03032026.rds"))
+final_fit<-readRDS(paste0(dir.final.model, model.input, "_xgb_model_LIMITED_stepdummy_less1000_reducedCor_pH_03182026.rds"))
 
 
 summary(final_fit)
@@ -1261,14 +1323,14 @@ summary(final_fit)
 #READ IMPUTED DATA
 dir.final.model.data<-paste0(dir.output, "/Final_model_comparisons/Final_train_test_datasets")
 #(note this is training data only)
-P.Predictors<-read.csv(paste0(dir.final.model.data, model.input, "_train_imputed_less1000_reducedCor_03032026.csv"))
+P.Predictors<-read.csv(paste0(dir.final.model.data, model.input, "_train_imputed_less1000_reducedCor_03182026_pH.csv"))
 
 P.Predictors$NLCD_Land<-factor(P.Predictors$NLCD_Land)
 
 #View(P.Predictors)
 
 #(test data)
-test.prep<-read.csv(paste0(dir.final.model.data, model.input, "_TEST_imputed_less1000_reduced_Cor_03032026.csv"))
+test.prep<-read.csv(paste0(dir.final.model.data, model.input, "_TEST_imputed_less1000_reduced_Cor_03182026_pH.csv"))
 
 test.prep$NLCD_Land<-factor(test.prep$NLCD_Land)
 
@@ -1459,7 +1521,7 @@ shap.plot.all<-sv_importance(shap, kind = "beeswarm", show_numbers = TRUE, max_d
 shap.plot.all
 #save plot to file
 
-png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_1_WSincluded_corReduced_less1000_02252026_ALL_FEATURES.png"), width = 4000, height = 6000, res = 300)    
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_1_WSincluded_corReduced_less1000_pH_03182026_ALL_FEATURES.png"), width = 4000, height = 6000, res = 300)    
 
 grid.newpage() 
 shap.plot.all
@@ -1488,35 +1550,53 @@ shap.plot1<-sv_importance(shap, kind = "beeswarm", show_numbers = TRUE, max_disp
   theme_bw()
 shap.plot1
 
+#top 10 with site specific characteristics included:
+shap.plot2<-sv_importance(shap, kind = "beeswarm", show_numbers = TRUE, max_display=10)+
+  scale_y_discrete(labels = c(
+    "pct.silt" = "% Silt",
+    "pct.clay" = "% Clay",
+    "waterinputcat" = "Water input",
+    "pctglactilloamws"= "% Glacial till, loamy (watershed)",
+    "pH" = "pH",
+    "manurews" = "Manure inputs (kg N/ha/yr)",
+    "kffactws" = "Soil erodibility factor",
+    "omws" = "Organic matter",
+    "pctglactilloamcat" = "% Glacial till, loamy (catchment)",
+    "hydricrating_No" = "Not hydric soils"
+    ))+
+  theme_bw()
+shap.plot2
+
 
 
 #save plot to file
 
-png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_1_WSincluded_corReduced_less1000_02252026.png"), width = 2200, height = 1400, res = 300)    
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_importance_plot_1_WSincluded_corReduced_less1000_pH_03182026.png"), width = 2200, height = 1400, res = 300)    
 
 grid.newpage() 
-shap.plot1
+shap.plot2
 dev.off()  
 
+```
 
+SHAP Dependency Plots:
+
+```{r}
 #Dependency plots using shapviz:
 
 #For a specific variable:
-   
 
-plot1<-sv_dependence(shap, v="waterinputcat", share_y=TRUE, color_var=NULL)+xlab("Water input")
+sv_dependence(shap, v="pctmxfst2011cat", share_y=TRUE, color_var=NULL)+xlab("% Mixed Foreste")
 
-plot2<-sv_dependence(shap, v="pctglactilloamws", share_y=TRUE, color_var=NULL)+xlab("% Glacial till, loamy \n (watershed)")
-  
-plot3<-sv_dependence(shap, v="Depth_cm", share_y=TRUE, color_var=NULL)+xlab("Depth (cm)")
+#Original Streambank P model (no site specific features)
 
-plot4<-sv_dependence(shap, v="kffactws", share_y=TRUE, color_var=NULL)+xlab("Soil erodibility")
+#plot3<-sv_dependence(shap, v="Depth_cm", share_y=TRUE, color_var=NULL)+xlab("Depth (cm)")
 
+#plot4<-sv_dependence(shap, v="kffactws", share_y=TRUE, color_var=NULL)+xlab("Soil erodibility")
 
-plot5<-sv_dependence(shap, v="pctglactilloamcat", share_y=TRUE, color_var=NULL)+xlab("% Glacial till, loamy \n (catchment)")
- 
+#plot5<-sv_dependence(shap, v="pctglactilloamcat", share_y=TRUE, color_var=NULL)+xlab("% Glacial till, loamy \n (catchment)")
 
-plot6<-sv_dependence(shap, v="hydricrating_No", share_y=TRUE, color_var=NULL)+ xlab("Not hydric soils")
+#plot6<-sv_dependence(shap, v="hydricrating_No", share_y=TRUE, color_var=NULL)+ xlab("Not hydric soils")
 
 #for some reason, this plot coming out incorrectly (are no negative values for wwtpmajordensws)
 #plot5<-sv_dependence(shap, v="wwtpmajordensws", share_y=TRUE, color_var=NULL)+xlab("WWTP density")
@@ -1533,25 +1613,47 @@ colnames(og.data)[1]<-"WWTP_dens"
 
 wwtp.shap<-cbind(wwtp.shap.data, og.data)
 
-plot7<-ggplot(wwtp.shap)+
+#plot7<-ggplot(wwtp.shap)+
   geom_point(aes(WWTP_dens, wwtpmajordensws), col="#3b528b")+
   xlab("WWTP density")+
   ylab("SHAP value")
-plot7
+#plot7
 
 
-plot8<-sv_dependence(shap, v="precip2009ws", share_y=TRUE, color_var=NULL)+xlab("Mean Precipitation (mm)")
+#plot8<-sv_dependence(shap, v="precip2009ws", share_y=TRUE, color_var=NULL)+xlab("Mean Precipitation (mm)")
 
-plot9<-sv_dependence(shap, v="omws", share_y=TRUE, color_var=NULL)+xlab ("Organic Matter")
+#plot9<-sv_dependence(shap, v="omws", share_y=TRUE, color_var=NULL)+xlab ("Organic Matter")
 
-plot10<-sv_dependence(shap, v = "rocknws", share_y = TRUE, color_var=NULL)+ xlab("N from rock weathering")
+#plot10<-sv_dependence(shap, v = "rocknws", share_y = TRUE, color_var=NULL)+ xlab("N from rock weathering")
+
+-----------------------
+## Site Specific features included
+
+plot1<-sv_dependence(shap, v="pct.silt", share_y=TRUE, color_var=NULL)+xlab("% Silt")
+
+plot2<-sv_dependence(shap, v="pct.clay", share_y=TRUE, color_var=NULL)+xlab("% Clay")
+  
+plot3<-sv_dependence(shap, v="waterinputcat", share_y=TRUE, color_var=NULL)+xlab("Water input")
+
+plot4<-sv_dependence(shap, v="pctglactilloamws", share_y=TRUE, color_var=NULL)+xlab("% Glacial till, loamy \n (watershed)")
+  
+plot5<-sv_dependence(shap, v="pH", share_y=TRUE, color_var=NULL)+xlab("pH")
+
+plot6<-sv_dependence(shap, v="manurews", share_y=TRUE, color_var=NULL)+xlab("Manure (kg N/ha/yr)")
+
+plot7<-sv_dependence(shap, v="kffactws", share_y=TRUE, color_var=NULL)+xlab("Soil erodibility")
+
+plot8<-sv_dependence(shap, v="omws", share_y=TRUE, color_var=NULL)+xlab("Organic Matter")
+
+plot9<-sv_dependence(shap, v="pctglactilloamcat", share_y=TRUE, color_var=NULL)+xlab("% Glacial till, loamy \n (catchment)")
+
+plot10<-sv_dependence(shap, v="hydricrating_No", share_y=TRUE, color_var=NULL)+ xlab("Not hydric soils")
+
+
 
 
 library(gridExtra)
 
-grid.newpage() 
-shap.plot1
-dev.off()  
 grid.arrange(plot1,
 plot2,
 plot3,
@@ -1564,7 +1666,7 @@ plot9,
 plot10, nrow=5, ncol=2)
 
 #save plot to file 
-png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_dependency_WSincluded_corReduced_less1000_02252026.png"), width = 1400, height = 3000, res = 300)    
+png(paste0(file.name=dir.figures, "/Fig_streambank_SHAP_dependency_WSincluded_corReduced_less1000_pH_03182026.png"), width = 1400, height = 3000, res = 300)    
 
 grid.arrange(plot1,
 plot2,
@@ -1758,7 +1860,7 @@ test.plot<-ggplot(Test_predictions, aes(x = P_mgkg, y = .pred)) +
 test.plot 
 
 #Save to plot to file
-png(paste0(file.name=dir.figures, "/Fig_pred_vs_obs_xgboost_reduced_with_WS_included_less1000_reducedcor_03022026.png"), width = 4, height = 4, units="in", res = 300)    
+png(paste0(file.name=dir.figures, "/Fig_STREAMBANK_pred_vs_obs_xgboost_reduced_with_WS_included_less1000_reducedcor_pH_031826.png"), width = 4, height = 4, units="in", res = 300)    
 
 grid.newpage() 
 print(test.plot) 
@@ -1792,6 +1894,34 @@ ggplot(Test_predictions %>% filter(P_mgkg<1000), aes(x = P_mgkg, y = .pred)) +
   xlim(0,1000)+
   ylim(0,1000)
 
+
+```
+
+Evaluating "acceptability" of model performance, based on Moriasi et al 2007
+
+<https://swat.tamu.edu/media/1312/moriasimodeleval.pdf>
+
+RSR - Based on the recommendation by Singh et al. (2004), a model evaluation statistic, named the RMSE-observations standard deviation ratio (RSR), was developed. RSR standardizes RMSE using the observations standard deviation, and it combines both an error index and the additional information recommended by Legates and McCabe (1999). RSR is calculated as the ratio of the RMSE and standard deviation of measured data
+
+NSE ranges between −∞ and 1.0 (1 inclusive), with NSE = 1 being the optimal value. Values between 0.0 and 1.0 are generally viewed as acceptable levels of performance, whereas values \< 0.0 indicates that the mean observed value is a better predictor than the simulated value, which indicates unacceptable performance.
+
+In general, model simulation can be judged as satisfactory if NSE \> 0.50 and RSR \< 0.70, and if PBIAS 25% for streamflow, PBIAS 55% for sediment, and PBIAS 70% for N and P
+
+```{r}
+#RMSE as a % of sample average
+mean(P.Predictors$P_mgkg)
+rmse/mean(P.Predictors$P_mgkg)
+
+#RSR - RMSE-observations standard deviation ratio (RSR)
+#< 0.7 is satisfactory
+rmse/sd(P.Predictors$P_mgkg)
+
+#Nash Sutcliffe efficiency (NSE)
+#should be >0
+Test_predictions %>% 
+  mutate(Diff=(P_mgkg-.pred)^2) %>% 
+  mutate(Diff.mean=(P_mgkg-mean(P_mgkg))^2) %>% 
+  summarise(sum.diff=sum(Diff), sum.diff.mean=sum(Diff.mean)) %>% mutate(NSE=1-(sum.diff/sum.diff.mean))
 
 ```
 
@@ -1900,7 +2030,7 @@ sort(names(new.test.data))
 
 ```
 
-## 8.2 Load model you wish to use to predict values for new dataset 
+## 8.2 Load model you wish to use to predict values for new dataset
 
 ```{r}
 

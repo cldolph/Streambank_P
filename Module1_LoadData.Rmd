@@ -6,7 +6,7 @@ output: html_document
 highlight: kate
     pandoc_args: ["--lua-filter=number-lines.lua"] # Optional: for continuous line numbering across chunks
 editor_options: 
-  chunk_output_type: console
+  chunk_output_type: inline
 ---
 
 # 1 Overview
@@ -28,7 +28,7 @@ rm(list=ls())
 #install and load packages
 
 #list of necessary packages 
-want <- c('data.table', 'tidyverse','tidyr', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'rgdal', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools', 'pbapply', 'digest', 'grid')
+want <- c('data.table', 'tidyverse', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools', 'pbapply', 'digest', 'grid')
 
 
 need <- want[!(want %in% installed.packages()[,"Package"])]
@@ -116,13 +116,13 @@ IL_streambank_samples.clean %>% dplyr::select(y,x) %>% distinct() %>% count() %>
 
 #358 streambank P locations 
 
+#Average streambank TP
+
 ```
 
 ## 3.2 Historic upland soil phosphorus data
 
 Historic soil samples pedons collected 1925-1976 by the Illinois Soil Survey.
-
-Note2: there is a subset of 226 samples in the historic data that are missing lat/longs
 
 ```{r}
 
@@ -212,13 +212,17 @@ names(historic.samples)
 historic.YEAR<-historic.samples %>% 
   dplyr::rename(P_mgkg='Total P  (mg/kg)', Depth_cm='Hzn_bottom (cm)') %>% 
   mutate(TimeCat=ifelse(year<1950, "pre-1950", "post-1950")) %>% 
-  mutate(as.factor(TimeCat))
+  mutate(factor(TimeCat, levels=c("pre-1950", "post-1950")))
 
 #Check mean P by time period
 historic.YEAR %>% 
   group_by(factor(TimeCat)) %>% 
   dplyr::summarize(meanP=mean(P_mgkg))
 
+levels(factor(historic.YEAR$TimeCat))
+
+#Change order of pre/post 1950 factor to be chronological 
+historic.YEAR$TimeCat<-factor(historic.YEAR$TimeCat, levels=c("pre-1950", "post-1950"))
 
 plot.1950<-
   ggplot(historic.YEAR)+   
@@ -283,12 +287,14 @@ usgs %>%
   dplyr::select(LATITUDE, LONGITUDE, P_mgkg, max_depth_est, NLCD06, MUTKEY, FEATUREID, ATTRIBUTE, WETLAND_TYPE, COLL_DATE) %>% 
   dplyr::rename(Date=COLL_DATE, x=LONGITUDE, y=LATITUDE) %>% 
   mutate(Depth_cm=max_depth_est*2.54) %>% #convert depth to cm
-  dplyr::select(-max_depth_est), #drop old depth est
+  dplyr::select(-max_depth_est) %>% #drop old depth est 
+  mutate(origin="USGS"),  
                   
 ncss %>% 
   dplyr::select(latitude_decimal_degrees, longitude_decimal_degrees, p_mjelm, hzn_bot, NLCD06, MUTKEY, FEATUREID, ATTRIBUTE, WETLAND_TYPE, Date) 
 %>% 
-  dplyr::rename(y=latitude_decimal_degrees, x=longitude_decimal_degrees, P_mgkg=p_mjelm, Depth_cm=hzn_bot)
+  dplyr::rename(y=latitude_decimal_degrees, x=longitude_decimal_degrees, P_mgkg=p_mjelm, Depth_cm=hzn_bot) %>% 
+  mutate(origin="NCSS")
 )
   
 names(soilP_database)
@@ -378,7 +384,7 @@ big.soil<-bind_rows(list_of_soil) %>%
 levels(factor(big.soil$dataset))
 ```
 
-## 4.3 Manuscript figure: Map of sample locations
+## 4.3 Manuscript figure: map of sample locations
 
 ```{r}
 #Create spatial object for all upland soil & streambank P locations
@@ -398,11 +404,11 @@ big_soil_sf<-st_as_sf(big.soil %>% filter(!is.na(x)), coords=c("x", "y"), crs=42
 levels(factor(big_soil_sf$dataset))
 
 big_soil_sf<-big_soil_sf %>% 
-  mutate(dataset_label=ifelse(dataset=="pre-1950"|dataset=="post-1950", "Margenot_pedon", dataset))
+  mutate(dataset_label=ifelse(dataset=="pre-1950"|dataset=="pre-1950", "Margenot_pedon", dataset))
 
 levels(factor(big_soil_sf$dataset_label))
 
-big_soil_sf$dataset_label=factor(big_soil_sf$dataset_label, levels=c("Margenot_pedon", "Margenot_streambank", "USGS_USDA"), labels=c("Historic IL soil pedons", "IL streambank samples", "Modern USGS/USDA soil pedons"))   
+big_soil_sf$dataset_label=factor(big_soil_sf$dataset_label, levels=c("Margenot_pedon", "Margenot_streambank", "USGS_USDA"), labels=c("Historic IL soil pedons", "IL streambank samples", "Modern USGS/USDA soil pedons"))  
 
 #Create bigger bounding box for legend
 
@@ -476,6 +482,51 @@ print(inset_map, vp = vp_inset)
 dev.off()
 ```
 
+## 4.4 Examine IL modern samples in more detail
+
+```{r}
+
+#Quick map- check how many usgs/usda samples are in IL
+tm_shape(states_sf %>% filter(STUSPS=="IL"))+
+  tm_borders()+
+  tm_shape(big_soil_sf %>% filter(dataset_label=="Modern USGS/USDA soil pedons"))+
+  tm_dots()
+
+#How many sites is this in IL?
+IL.sites<-st_intersection(big_soil_sf, states_sf %>% filter(STUSPS=="IL"))
+
+IL.sites %>% filter(dataset=="USGS_USDA") %>% dplyr::mutate(lon = sf::st_coordinates(.)[,1],
+                lat = sf::st_coordinates(.)[,2]) %>% 
+  distinct(lat, lon) %>% nrow()
+#29 sites
+
+#What is the average P of upland IL pedons?
+IL.sites %>% filter(dataset=="USGS_USDA") %>% summarise(meanP=mean(P_mgkg), minP=min(P_mgkg), maxP=max(P_mgkg))
+
+#How much comes from USGS vs USDA?
+View(IL.sites %>% filter(dataset=="USGS_USDA"))
+
+
+#Add dataset identifier
+
+names(soilP_database)
+
+soilP_sf<-st_as_sf(soilP_database, coords=c("x", "y"), crs=4269)
+
+IL.sites2<-st_intersection(soilP_sf, states_sf %>% filter(STUSPS=="IL"))
+
+View(IL.sites2)
+
+#When is the data I have from??
+
+IL.sites2 %>% group_by(origin) %>% 
+  summarise(meanP=mean(P_mgkg), minP=min(P_mgkg), maxP=max(P_mgkg))
+
+soilP_database %>% group_by(origin) %>% distinct(x,y) %>% count()
+
+
+```
+
 # 5 Summarize Soil P data
 
 ## 5.1 Examine historic IL soil pedon data
@@ -488,10 +539,44 @@ big_soil_sf %>%
   summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg))
 
 
+names(historic.YEAR)
+
 #Average for historic samples, by year range
+#Filter to soil surface
 historic.YEAR %>% 
 dplyr::group_by(TimeCat) %>% 
-  dplyr::summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg))
+  filter(Depth_cm<=30) %>% 
+  dplyr::summarize(meanP=mean(P_mgkg), medianP=median(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg))
+
+#Mean in "surface" layer (<15cm deep)
+historic.YEAR %>% 
+  dplyr::group_by(TimeCat) %>% 
+  filter(Depth_cm>15) %>% 
+  dplyr::summarize(meanP=mean(P_mgkg), medianP=median(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg))
+
+
+#Count number of sample sites
+historic.YEAR %>%
+  distinct(Latitude, Longitude, TimeCat) %>%   group_by(TimeCat) %>% dplyr::summarise(n=n()) 
+
+#Count number of samples
+  historic.YEAR %>% group_by(TimeCat) %>% dplyr::summarise(n=n()) 
+  
+#Mean depth by time period
+  historic.YEAR %>% filter(!is.na(Depth_cm)) %>% group_by(TimeCat) %>% 
+    dplyr::summarise(meanDepth=mean(Depth_cm, na.remove=TRUE), medianDepth=median(Depth_cm), maxDepth=max(Depth_cm))
+
+  
+    
+#Issues with representativeness of sample
+  #if different #s of samples were collected per site 
+  #weighted average??
+  
+#Number of depths sampled per site pre and post 1950
+
+  historic.YEAR %>% group_by(Latitude, Longitude, TimeCat) %>% dplyr::summarise(n=n())
+  
+  
 ```
 
 ## 5.2 Mean P value for other datasets
@@ -501,11 +586,32 @@ names(big.soil)
 
 levels(factor(big.soil$dataset))
 
-#USGS/USDA
-big.soil %>% filter(dataset=="USGS_USDA"& P_mgkg>0) %>% dplyr::summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg), sdP=sd(P_mgkg))
+#Mean TP by dataset and depth category
+#For modern soil, restrict to OH, IL, IA, IN?
 
-#IL Streambank:
-big.soil %>% filter(dataset=="Margenot_streambank"& P_mgkg>0) %>% dplyr::summarize(meanP=mean(P_mgkg), maxP=max(P_mgkg), minP=min(P_mgkg), sdP=sd(P_mgkg))
+big.soil.states<-st_intersection(big_soil_sf, states %>% filter(STUSPS %in% c("IA", "IL", "IN", "OH")))
+
+View(big.soil.states)
+
+TP.summary<-big.soil.states %>% 
+  filter(P_mgkg>0&!is.na(Depth_cm)) %>% 
+  mutate(DepthCat=ifelse(Depth_cm<30, "<30", Depth_cm)) %>% 
+  mutate(DepthCat=ifelse(Depth_cm>=30&Depth_cm<60, "30-60", DepthCat)) %>%
+  mutate(DepthCat=ifelse(Depth_cm>=60, ">60", DepthCat)) %>%
+  mutate(DepthCat=factor(DepthCat, levels=c("<30", "30-60", ">60"))) %>% 
+  group_by(dataset, DepthCat) %>% 
+  dplyr::summarize(
+    meanP=round(mean(P_mgkg),0), 
+    medianP=round(median(P_mgkg),0),
+    maxP=round(max(P_mgkg),0), 
+    minP=round(min(P_mgkg),0), 
+    sdP=round(sd(P_mgkg),0),
+    n=n()
+    )
+
+View(TP.summary)
+
+write_xlsx(TP.summary, paste0(dir.figures, "/TP_by_dataset_and_depth.xlsx"))
 
 #Percent above 1000 mg/kg
 
@@ -515,22 +621,32 @@ big.soil %>% filter(dataset=="USGS_USDA"&P_mgkg>1000) %>% nrow()/big.soil %>% fi
 big.soil %>% filter(dataset=="Margenot_streambank"&P_mgkg>1000) %>% nrow()/big.soil %>% filter(dataset=="Margenot_streambank") %>% nrow()
 ```
 
-## 5.3 Manuscript figure: Plot P by depth category across datasets
+## 5.3 Summarize by depth
 
-Note that the boxplot figure was not included in the final manuscript.
+```{r}
+
+#Mean and max depth by dataset:
+big.soil %>% filter(!is.na(Depth_cm)) %>% 
+  dplyr::group_by(dataset) %>% 
+  dplyr::summarize(maxdepth=max(Depth_cm), meandepth=mean(Depth_cm), mediandepth=median(Depth_cm))
+
+
+levels(factor(big.soil$dataset))  
+
+```
+
+## 5.4 Manuscript figure: Plot P by depth category across datasets
 
 ```{r}
 
 
 #Make nice labels for datasets
-levels(factor(big.soil$dataset))
-
 big.soil$dataset<-factor(big.soil$dataset, levels=c("pre-1950", "post-1950", "USGS_USDA", "Margenot_streambank"),
                           labels=c("historic IL soil pedons, 1925-1950", "historic IL soil pedons, 1950-1976", "post-2000 USGS/USDA soil pedons (IA, IL, IN, OH)", "IL Streambank samples"))
 
 #Make some depth categories
 
-big.soil2<-big.soil %>% 
+big.soil2<-big.soil2 %>% 
   mutate(DepthCat=ifelse(Depth_cm<75, "<75 cm", NA)) %>% 
   mutate(DepthCat=ifelse(Depth_cm>=75&Depth_cm<300, "75-300 cm", DepthCat)) %>% 
   mutate(DepthCat=ifelse(Depth_cm>=300, ">300 cm", DepthCat)) %>% 
@@ -540,16 +656,15 @@ big.soil2<-big.soil %>%
 big.soil2<-big.soil2 %>% 
   mutate(DepthCat2=ifelse(Depth_cm<75, "<75 cm", ">75 cm"))
 
+#Boxplot showing P by depth category:
 
------------------------------------------
-###Boxplot showing P by depth category:
 
 Pdepth_boxplot<-ggplot(big.soil2 %>% filter(!is.na(DepthCat2)), aes(x=DepthCat2, y=P_mgkg, fill=dataset))+
 #geom_jitter(aes(DepthCat, P_mgkg, fill=dataset))+
 geom_boxplot()+
 scale_fill_brewer(palette="BrBG")+
   xlab("Soil Depth")+
-ylab(bquote(Total~P~(mg~kg^-1)))+
+ylab("Total P (mg/kg)")+
 theme_bw()+
 theme(panel.grid=element_blank(), legend.title = element_blank(), legend.position="inside", legend.position.inside=c(0.5,0.85), axis.title = element_text(size = 14),
     axis.text = element_text(size = 14), legend.text=element_text(size=14), legend.background = element_rect(fill = "transparent"))
@@ -563,8 +678,8 @@ print(Pdepth_boxplot)
 
 dev.off()     
 
--------------------------------------------------
-###Scatterplot showing P by depth across datasets
+
+#Scatterplot
 
 #add a mean line for each dataset
 meanP <- big.soil2 %>% 
@@ -579,7 +694,7 @@ Pdepth_scatter<-ggplot(big.soil2)+
   #geom_smooth(aes(Depth_cm, P_mgkg), method="lm", linetype="dashed")+
   facet_wrap(~dataset, ncol=1)+
   xlab("Soil Depth (cm)")+
-  ylab(bquote(Total~P~(mg~kg^-1)))+
+  ylab("Total P (mg/kg)")+
   theme_bw()+
   theme(strip.text=element_text(size=14), axis.title = element_text(size = 14),
     axis.text = element_text(size = 14),
@@ -602,7 +717,7 @@ dev.off()
 
 # 6 Set Up Data For Assigning Attributes
 
-Select dataset of interest for linking to attributes in next module (or use big.soil dataset to link attributes for all locations)
+Set dataset of interest for linking to attributes in next module
 
 ```{r}
 
@@ -615,10 +730,6 @@ samples.clean<-IL_streambank_samples.clean
 #OR
 
 samples.clean<-historic.samples.clean
-
-#OR (for assigning attributes to all samples from all datasets at once)
-
-samples.clean<-big.soil
 ```
 
 # 7 Get area of interest and plot map
@@ -668,7 +779,6 @@ tm_shape(loc_sf)+
   tm_layout(legend.outside = TRUE, legend.outside.position = c("right", "top"))
 Sites.map
 
-#Save map if desired (note: these maps were not used in Manuscript)
 
 #tmap_save(Sites.map, filename=paste0(dir.figures, "/Margenot_IL_sites_map_PEDONS.jpg"), dpi=300)
 
