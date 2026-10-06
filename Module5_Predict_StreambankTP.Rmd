@@ -1,0 +1,600 @@
+---
+title: "Module4_Predict_StreambankP"
+author: "Christy Dolph"
+date: "2026-08-07"
+output: html_document
+---
+
+# Overview
+
+This module predicts TP for locations at different depths along the river network in Illinois, to create a simulated map of Streambank TP values based on the models developed in Module 3. The following attributes were assigned in ArcGIS Pro: NHD (including comid), National Wetlands Inventory, NLCD (2019), SSURGO mukey. The methods were as follows:
+
+- Add NHDPlusv2 - seamless flatted NHD network for lower 48 in EPA2 GIS folder
+
+- Add IL state outline - from ‘states’ file in EPA folder
+
+- Clip NHD network by IL state outline
+
+- Project NHD network for IL to a crs that uses meters → Albers Equal Area Conic
+
+- Generate Points Along Lines (took 53 minutes) 
+
+  - Distance: 30 m
+
+  - 3,3738,231 points
+
+  - they already have comid and all NHD attributes 
+
+- Add IL wetlands from NWI already downloaded - Spatial Join NWI to NHD_30m (took 17 min)
+
+- Delete Field tool to remove unneeded columns (to improve processing time hopefully)(hm, it’s quite slow - 3.5 hours)
+
+- NLCD: Extract Values to Points - using NLCD IL tiff file downloaded via R script in StreambankP Spatial Data folder
+
+- SSURGO mukey: Spatial Join MUPOLYGON to NHD_30m_NWI_NLCD (took 40 min)
+
+# Workspace Set Up
+
+Load libraries and define directories.
+
+```{r}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Clean up workspace 
+rm(list=ls())
+
+
+#list of necessary packages 
+want <- c('tidyverse', 'sf', 'tmap', 'nhdplusTools', 'USAboundaries', 'data.table')
+
+need <- want[!(want %in% installed.packages()[,"Package"])]
+if (length(need)) install.packages(need)
+lapply(want, function(i) require(i, character.only=TRUE))
+rm(want, need)
+
+#Install StreamCatTools (if not already installed):
+# First install remotes if needed
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+# Install StreamCatTools
+if (!requireNamespace("StreamCatTools", quietly = TRUE)) {
+  remotes::install_github("USEPA/StreamCatTools")
+}
+# Load the package
+library(StreamCatTools)
+
+#Main directory
+dir.root<-getwd()
+
+#Input data
+dir.data<-paste(dir.root, "/TP_data", sep="")
+
+#Spatial data
+dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
+
+#Output data (produced by script)
+dir.output<-paste0(dir.root, "/output_data")
+
+dir.figures<-paste0(dir.root, '/Maps_figures')
+
+#set directories for final saved models + data
+
+dir.final.model.data<-paste0(dir.output, "/Final_model_comparisons/Final_train_test_datasets")
+
+dir.final.model<-paste0(dir.output, "/Final_model_comparisons")
+
+```
+
+# Load grid points
+
+```{r}
+
+grid<-fread(paste0(dir.output, "/NHD_points_30m_NWI_NLCD_SSURGO.csv"))
+nrow(grid)
+
+names(grid)
+
+#format grid points
+
+grid<-grid %>% 
+  rename_with(tolower)
+
+#format mukey
+grid$mukey<-as.factor(grid$mukey)
+
+#Create SampleID if it doesn't exist
+
+grid<-grid %>% 
+  dplyr::mutate(SampleID=row_number()) %>% #Create sample ID
+  dplyr::rename(x=point_x, y=point_y) #rename coordinate columns
+
+names(grid)
+```
+
+# Get StreamCat attributes for Illinois
+
+```{r}
+
+#Note - pulling StreamCat attributes using StreamCatTools seems to function better in the morning ours; afternoon is more likely to see a 502 bad gateway error (maybe based on broader traffic etc)
+
+#Get a list of all Streamcat attributes available: 
+All.Streamcat<-sc_get_params(param="metric_names")
+
+
+#View(as.data.frame(All.Streamcat))
+
+#Get all variable descriptions!!
+#Definitions<-sc_get_params(param='variable_info')
+#View(Definitions)
+
+#Subset the Streamcat attributes you want to use
+#eliminate fire related, containing "burn", "sev", "fire", "procmask"
+#remove veg change, "vegresp", forest loss "frstloss"
+#select relevant NLCD year & eliminate all other years
+#the following attributes are all based on NANI and are available every year, retain one of each variable for the year of interest, exclude all others: "n_ff, p_ff, n_uf,p_uf,p_hw,n_hw,n_lw,p_lw,n_cr,p_cr,n_cf,n_lwr,p_lwr,n_ags,p_ags"
+
+All.Streamcat<-as.data.frame(All.Streamcat)
+
+
+#Clean up metrics filtering logic (fix vector reference in dplyr)
+Streamcat.select <- All.Streamcat %>% 
+  filter(!grepl('burn|sev|fire|procmask|vegresp|frstloss', All.Streamcat)) %>% 
+  filter(!grepl('2001|2004|2006|2008|2013|2016|2019', All.Streamcat)) %>% 
+  filter(!grepl('_19|_20', All.Streamcat))
+
+metrics_vec <- Streamcat.select$All.Streamcat
+
+#Pull metrics sequentially or in small groups, otherwise will hit bad gateway error  
+
+metric_chunks <- split(metrics_vec, ceiling(seq_along(metrics_vec) / 5))
+
+#-----------------------------------------------------------
+#Get cat and ws scale metrics
+#-----------------------------------------------------------
+
+#Check time
+start.time<-Sys.time()
+start.time
+# Loop over metric chunks instead of sending all at once
+sc_data_list <- lapply(metric_chunks, function(m_chunk) {
+  m_list <- paste0(m_chunk, collapse = ",")
+  
+  # Fetch data across COMIDs for this metric subset
+  # Using county or state parameter if fetching all COMIDs in Illinois
+  tryCatch({
+    sc_get_data(
+      metric = m_list, 
+      aoi = "cat,ws", 
+      state = "IL", # Direct state fetch if fetching all of Illinois
+      showAreaSqKm = FALSE
+    )
+  }, error = function(e) {
+    message("Failed chunk: ", e$message)
+    return(NULL)
+  })
+})
+
+# Merge columns across results
+sc_data <- Reduce(function(x, y) merge(x, y, by = "comid", all = TRUE), sc_data_list)
+
+#Write to file to save intermediate work
+write.csv(sc_data, paste0(dir.output, "/Streamcat_IL_cat_ws.csv"))
+
+#------------------------------------------------------------
+#Run again for riparian attributes
+#-----------------------------------------------------------
+
+#Hm, i wonder if i need to subset to attributes that are available at riparian scale - see definitions?
+
+# Fetch data across COMIDs for this metric subset
+# Using county or state parameter if fetching all COMIDs in Illinois
+start.time<-Sys.time()
+start.time
+sc_data_list <- lapply(metric_chunks, function(m_chunk) {
+  m_list <- paste0(m_chunk, collapse = ",")
+  
+tryCatch({
+  sc_get_data(
+    metric = m_list, 
+    aoi = "catrp100,wsrp100", 
+    state = "IL", # Direct state fetch if fetching all of Illinois
+    showAreaSqKm = FALSE
+  )
+}, error = function(e) {
+  message("Failed chunk: ", e$message)
+  return(NULL)
+})
+})
+  
+  # Merge columns across results
+  sc_data_rp <- Reduce(function(x, y) merge(x, y, by = "comid", all = TRUE), sc_data_list)
+
+end.time<-Sys.time()
+end.time
+
+end.time-start.time 
+#Write to file to save intermediate work
+write.csv(sc_data_rp, paste0(dir.output, "/Streamcat_IL_catRP_wsRP.csv"))
+
+
+#Merge to grid points
+
+#first cat, ws: 
+grid.streamcat<-left_join(grid, sc_data, by="comid")
+
+head(grid.streamcat)
+
+#then catrp100, wsrp100
+
+grid.streamcat.all<-left_join(grid.streamcat, sc_data_rp, by="comid")
+
+names(grid.streamcat.all)
+
+#Write to file to save intermediate work (use fwrite for large file, much faster than write.csv)
+fwrite(grid.streamcat.all, paste0(dir.output, "/grid_streamcat.all.csv"))
+```
+
+# Get SSURGO attributes by mukey
+
+```{r}
+
+#read in grid.streamcat if needed
+grid.streamcat.all<-fread(paste0(dir.output, "/grid_streamcat.all.csv"))
+
+#can ignore warnings about simple feature geometries not being present  
+options(warn=-1)  
+
+#Set directory for ssurgo data 
+ssurgo_dir<-paste0(dir.spatial, "/ssurgo") 
+ssurgo_dir  
+
+#ID states in study region 
+states<-as.list("IL") 
+states  
+
+#Function to read one layer across all states
+read_layer <- function(layer) {
+  # Use map to create a list, then row-bind
+  res_list <- map(states, ~ {
+    gdb_path <- file.path(ssurgo_dir, paste0("gSSURGO_", .x, ".gdb"))
+    message("Reading ", layer, " for state: ", .x)
+    st_read(dsn = gdb_path, layer = layer, quiet = TRUE) %>%
+      mutate(State = .x)
+  })
+  
+  # Combine list into one data frame
+  list_rbind(res_list)
+}
+
+# Read multiple layers into a named list
+layers <- c("component", "Valu1")
+
+layer_data <- map(set_names(layers), read_layer)
+
+```
+
+## Component table
+
+```{r}
+#Create Component layer:
+Component<-layer_data$component
+
+
+#Check if component layers are unique --> they are
+nrow(Component)
+
+Component %>% 
+  dplyr::select(cokey) %>% 
+  distinct() %>% 
+  nrow()
+
+
+#Number of map units
+Component %>% dplyr::select(mukey) %>% distinct() %>% nrow()
+
+
+#Check map units against sample locations:
+grid.streamcat.all %>% 
+  filter(!mukey %in% unique(Component$mukey))
+#-->All sample mapunits are in component table
+
+Component %>% 
+  filter(mukey %in% grid.streamcat.all$mukey) %>% 
+  dplyr::select(cokey) %>% 
+  distinct()
+#-->are multiple components per map unit 
+
+#Find mukey associated with specific cokey
+Component %>% filter(mukey=="407496") %>% 
+  dplyr::select(mukey, cokey)
+
+##Subset to desired ssurgo attributes - ie, those likely to be related to P content (as per Records et al 2016) AND to mapunits that overlap with study sites
+
+#Subset Component attributes 
+names(Component)
+Component.list<-c('comppct_r', 'slope_r', 'slopelenusle_r','runoff',
+                  'erocl', 'hydricon', 'hydricrating', 'drainagecl', 'elev_r', 'geomdesc',
+                  'airtempa_r', 'reannualprecip_r', 'ffd_r', 'taxceactcl', 'taxreaction', 'taxpartsize',
+                  'mukey', 'cokey')
+
+
+Component.sub<-Component %>% 
+  dplyr::select(any_of(Component.list)) %>%  #select desired attributes
+  filter(mukey %in% grid.streamcat.all$mukey)  #subset mapunits to those overlapping with sample sites
+  
+```
+
+#### b. Valu1 Table
+
+These are commonly used attributes already aggregated in SSURGO at the map unit scale
+
+```{r}
+
+valu1<-layer_data$Valu1
+
+names(valu1)
+
+```
+
+### iv. Merge SSURGO attributes to the map unit scale.
+
+Merge everything to mukey; using cokey
+
+Need comppct from component table for % contribution of each component to each mukey (see below)
+
+NOTE: not all cokeys associated with sample locations have attributes in other tables, so use all.x=TRUE to keep all sample locations
+
+```{r}
+#COMPLETE LIST OF SSURGO TABLES NEEDED:
+names(Component.sub) #component unit (cokey)
+names(valu1) #map unit (mukey)
+
+```
+
+### v. Summarize/aggregate gSSURGO attributes at the map unit scale
+
+Steps:
+
+1.  Check column types to make sure each is designated as correct type (either numeric or factor).
+2.  Simplify/reclassify categorical attributes with many levels.
+3.  Summarize component scale attributes at the map unit scale.
+4.  For numeric variables, take weighted average for each map unit.
+5.  For categorical variable, take component with highest % of map unit for each sample. (For ties, the first row in each group is arbitrarily selected)
+
+Weights are 'comppct_r' - i.e., the percent of each component in the map unit (the mukey)
+
+**Check attribute type and reclassify attributes as needed:**
+
+```{r}
+sapply(Component.sub, class)
+
+#rename table to be consistent with main script
+Comp2<-Component.sub
+
+#Assign correct class to each attribute
+names(Comp2)
+#ID numeric variables
+Numeric.list <- c("slope_r", "slopelenusle_r", "elev_r", "airtempa_r", "reannualprecip_r",
+  "ffd_r", "comppct_r"
+)
+
+
+#ID categorical variables
+Categorical.list <- c("runoff", "erocl", "hydricon", "hydricrating", "drainagecl", "taxpartsize", "taxceactcl", "taxreaction", "mukey")
+
+
+#Variables to exclude or modify (eg, aggregate or code dummy variables):
+#geomdesc - too many levels
+
+
+#Transform numeric and categorical attributes as appropriate:
+Comp2 <- Comp2 %>%
+  mutate(across(all_of(Numeric.list), as.numeric)) %>% 
+  mutate(across(all_of(Categorical.list), as.factor)) %>% 
+  mutate(mukey=as.factor(mukey), taxpartsize=as.factor(taxpartsize), taxreaction=as.factor(taxreaction), taxceactcl=as.factor(taxceactcl))
+
+summary(Comp2)
+```
+
+**Summarize Attributes:**
+
+For each soil sample, calculate the weighted average of numeric attributes at the map unit scale that occur at the component scale. Select the categorical attributes with the highest component area.
+
+Note that it is possible to have more than one sample at the same location but at different sample depths. Thus, samples are also assigned the corresponding most closely matching horizon depths from the Chorizon table in SSURGO prior to calculating weighted averages. To do this, before summarizing component attributes, assign horizon depth to sample sites. This should result in the assignment of one of *each* the cokeys in a map unit (MUKEY) to each sample. (Otherwise the sample will be assigned to multiple horizons).
+
+```{r}
+#Steps:
+#Join SSURGO attributes to sample data (P.streamcat) based on mukey
+#then select rows where actual measured Depth_cm is between Chorizon table hzdepth values
+#hzdepb_r = bottom depth of a horizon
+#hzdept_r = top depth of a horizon 
+
+
+#Note, must use allow.cartersian=TRUE or otherwise get an error, because of the one to many join
+P.ssurgo1<-left_join(grid.streamcat.all, Comp2, by=c("mukey"))
+
+#allow.cartesian=TRUE)
+
+#filter if Depth of soil sample is between hz levels
+#not applicable for limited SSURGO attributes (ie, if horizon tables have been excluded)
+#P.ssurgo.depth<-P.ssurgo1 %>%
+#  filter(Depth_cm <= hzdepb_r & Depth_cm >= hzdept_r)
+
+#Check that it worked for a samples in a select mapunit: 
+#View(P.ssurgo.depth %>% dplyr::select(MUKEY, cokey, SampleID, comppct_r, hzname, hzdept_r, hzdepb_r, Depth_cm, kffact) %>% filter(MUKEY=="100040"))
+
+
+
+#For numeric attributes - 
+#calculate weighted mean for each sample in each map unit (MUKEY). Weights are % contribution of each component (comppct_r) to the total map unit area. 
+#calculate for multiple attributes at once
+
+Mukey.mean<-P.ssurgo1 %>% group_by(mukey, SampleID) %>% 
+  summarise_at(Numeric.list, 
+               list(~weighted.mean(., comppct_r)))
+names(Mukey.mean)
+
+#Check result:
+#View(Mukey.mean %>% dplyr::select(MUKEY, SampleID, kffact, comppct_r) %>% filter(MUKEY=="100040"))
+
+
+#For categorical attributes - 
+#select component level with the highest percentage area in the map unit, for each sample
+
+#group by mukey and sample ID
+#apply just across columns in Categorical.list
+#select attribute levels in each group based on max compcct_r
+#note this will just pick the first value if there is a tie:
+#(somewhat arbitrary)
+
+Mukey.top_cat<-P.ssurgo1 %>% 
+  dplyr::select(mukey, SampleID, comppct_r, all_of(Categorical.list)) %>%
+  group_by(mukey, SampleID) %>% 
+  dplyr::slice(which.max(comppct_r))
+
+# View the result
+#View(Mukey.top_cat %>% dplyr::select(MUKEY, SampleID, pmorigin, comppct_r) %>% filter(MUKEY=="100040"))
+
+##So now you have:
+#weighted average for numeric variables for each sample site in each map unit
+#categorical attribute with highest percentage area for each sample site in map unit
+
+```
+
+Merge numeric and categorical SSURGO attributes to all other attributes and write to file:
+
+```{r}
+#Merge the two;
+SSURGO.att<-merge(Mukey.mean, Mukey.top_cat, by=c('mukey', 'SampleID'))
+head(SSURGO.att)
+#View(SSURGO.att)
+
+#Add in attributes from Valu1 table
+SSURGO.all<-merge(SSURGO.att, valu1, by=c('mukey'))
+head(SSURGO.all)
+
+#Check that mukeys for sample locations were included
+if(nrow(grid.streamcat.all)==
+grid.streamcat.all %>% 
+  filter(mukey %in% unique(SSURGO.all$mukey)) %>% 
+  nrow()
+)
+{message("yes all sample locations have mapunit data after merging with valu1 table")} else{
+  message("some mapunits missing")
+}
+
+#Note: some mukeys may have been omitted if they were not in all SSURGO tables - this seems to occur for map units associated with water areas
+
+```
+
+## vi. Merge ssurgo attributes to sample locations
+
+```{r}
+#Merge back to all other attributes previously added for sample locations:
+soilP.att<-left_join(grid.streamcat.all, SSURGO.all, by=c("SampleID", "mukey"))
+#View(soilP.att)
+nrow(soilP.att)
+
+#write to table;
+#these are unique attributes for each map unit, from multiple SSURGO tables
+
+fwrite(soilP.att, paste0(dir.output, '/prediction_grid_points_SSURGO_attributes_mapunit_LIMITED.csv'), sep=",", row.names=FALSE)
+
+```
+
+# Clean up all attributes -
+
+Sample datasets have had the following pre-processing:
+
+- NHD stream type from NHDv2Plus
+
+- NWI wetland type, if within wetland polygon
+
+- NLCD 2019 Land Use category in 30m cell where sample occurs
+
+- EPA StreamCat attributes
+
+- gSSURGO attributes
+
+Additional processing below:
+
+- remove extraneous attributes (not likely applicable to study area)
+
+- remove attributes with no information (all 0 or all NA)
+
+## Remove meta data attributes
+
+```{r}
+
+#Read in data to date
+soilP.att<-fread(paste0(dir.output, "/prediction_grid_points_SSURGO_attributes_mapunit_LIMITED.csv"))
+
+names(soilP.att)
+
+#Remove administrative attributes: 
+
+soilP.less<-
+soilP.att %>% 
+  dplyr::select(-contains(c('join_count', 'target_fid', 'join_count_1', 'target_fid_1', 'orig_fid', 'State', 'mukey', 'musym', 'acres', 'id', 'dataset', 'replicates', 'field_1', 'comppct_r.x', 'comppct_r.y', 'musumcpct', 'musumcpcta', 'musumcpcts'))) %>% 
+  dplyr::select(-starts_with("X", ignore.case = FALSE)) 
+
+ncol(soilP.att)
+ncol(soilP.less)
+
+names(soilP.less)
+
+#View(soilP.less)
+```
+
+## Combine replicate streambank measurements (if applicable)
+
+**If no replicates, just do the following:**
+
+```{r}
+P.data<-soilP.less
+```
+
+## Create non wetland category for wetland attributes
+
+```{r}
+P.data<- P.data %>%
+  rename(WETLAND_TYPE=wetland_type, ATTRIBUTE=attribute) %>% 
+  mutate(WETLAND_TYPE=ifelse(is.na(WETLAND_TYPE), "Non wetland", WETLAND_TYPE)) %>%    
+  mutate(WETLAND_ATTRIBUTE=ifelse(is.na(ATTRIBUTE), "Non wetland", ATTRIBUTE)) %>%
+  dplyr::select(-ATTRIBUTE)  
+```
+
+## Features to include
+
+### i. Match columns to original dataset used to build soil P model
+
+Note: this needs to be updated for columns actually used in model
+
+```{r}
+#Load data used to build model of interest:
+
+model<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED'
+
+model_dataset <-read.csv(paste0(dir.output, model, '.csv'))
+
+head(model_dataset)
+names(model_dataset)
+
+#Match attributes to original dataset
+soilP.data<-P.data %>% 
+  dplyr::select(any_of(names(model_dataset)))
+
+names(soilP.data)
+
+names(model_dataset)
+```
+
+## Write final data to file
+
+```{r}
+#Write to file
+
+fwrite(soilP.data, paste0(dir.output, 'prediction_grid_points_SSURGO_attributes_mapunit_LIMITED.csv'), sep=",", row.names=FALSE)
+```

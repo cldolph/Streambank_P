@@ -1,0 +1,553 @@
+---
+title: "Compare streambank & Midwest samples"
+author: "Christy Dolph"
+date: "2026-08-31"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Overview
+
+This script compares TP, depth and other geospatial predictors representative of soils, climate and land use among streambank and Midwest datasets.
+
+# Workspace Setup
+
+Load packages and set directories.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Clean up workspace 
+rm(list=ls())
+
+
+#install and load packages
+
+#list of necessary packages 
+want <- c('data.table', 'tidyverse', 'readxl', 'writexl', 'data.table', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools', 'pbapply', 'digest', 'grid')
+
+
+need <- want[!(want %in% installed.packages()[,"Package"])]
+if (length(need)) install.packages(need)
+lapply(want, function(i) require(i, character.only=TRUE))
+rm(want, need)
+
+
+#Install StreamCatTools (if not already installed):
+# First install remotes if needed
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+# Install StreamCatTools
+if (!requireNamespace("StreamCatTools", quietly = TRUE)) {
+  remotes::install_github("USEPA/StreamCatTools")
+}
+# Load the package
+library(StreamCatTools)
+
+
+
+# Create subdirectory shortcuts
+
+#Main directory
+dir.root<-getwd()
+
+#Input data
+dir.data<-paste(dir.root, "/Streambank_P_measured_data", sep="")
+
+#Spatial data
+dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
+
+#Output data (produced by script)
+dir.output<-paste0(dir.root, "/output_data")
+
+dir.figures<-paste0(dir.root, '/Maps_figures')
+
+# Create additional folder destinations, if they don't already exist:
+dir.create(file.path(getwd(), "Spatial_data"))
+dir.create(file.path(dir.spatial, "nlcd"))
+dir.create(file.path(dir.spatial,"ssurgo"))
+dir.create(file.path(dir.root,"output_data"))
+dir.create(file.path(dir.root, "Maps_figures"))
+
+
+```
+
+# Compare TP among streambank samples (by major watershed) and Midwestern samples
+
+```{r}
+
+
+#Margenot et al IL streambank P data, with limited ssurgo attributes to retain all data, for independent streambank model or for running through existing soil TP model (predictors are matched below): 
+model.input<-"/Margenot_sample_attributes_for_modelling_wSSURGO_LIMITED_comid"
+
+streambank <-read.csv(paste0(dir.output, model.input, '.csv'))
+
+
+#Count number of streambank sample locations by NHD stream reach
+names(streambank)
+
+Num.samples.bycomid<-streambank |> dplyr::select(x,y,comid) |> distinct() |> dplyr::select(comid) |> group_by(comid) |> count()
+Num.samples.bycomid
+
+summary(Num.samples.bycomid$freq)
+
+
+
+#For streambank data, get NHD attributes, including HUC8
+
+#create shapefile of sample locations:
+
+streambank_sf<-st_as_sf(streambank, coords=c("x", "y"), crs=4269, remove=FALSE)
+
+
+#creating bounding box for sample locations
+
+bb = st_as_sfc(st_bbox(streambank_sf))
+
+
+#Get HUC8 info
+huc8_polygon <- get_huc(AOI = bb, type = "huc08")
+
+# 4. Extract the HUC8 Code and Name
+# drop the spatial geometry layer to return a clean data frame
+huc8_info <- huc8_polygon %>%
+  st_drop_geometry() %>%
+  dplyr::select(huc8, name)
+
+#OR, spatial join huc8 ID directly to streambank locations, if are plotting by HUC8
+
+streambank_huc8<-st_join(streambank_sf, huc8_polygon)
+head(streambank_huc8)
+
+#Count number of streambank sample locations by HUC8
+
+names(streambank_huc8)
+
+Num.samples.byHUC8<-streambank_huc8 |> dplyr::select(x,y,huc8,name) |> st_drop_geometry() |> distinct() |> dplyr::select(huc8, name) |> group_by(huc8) |> count()
+Num.samples.byHUC8
+
+write.csv(Num.samples.byHUC8, paste0(dir.figures, "/Table_streambank_samples_by_HUC8.csv"), row.names=FALSE)
+
+
+#Mean number of samples per watershed
+summary(Num.samples.byHUC8$freq)
+
+write.csv(Num.samples.byHUC8, paste0(dir.figures, "/Table_streambank_samples_by_HUC8.csv"), row.names=FALSE)
+
+
+#Modern Midwest Soil P database:
+model.input2<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED'
+
+
+#Modern Midwest soil P database but with limited ssurgo attributes that should encompass water areas?
+#model.input<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED_comid'
+
+Midwest <-read.csv(paste0(dir.output, model.input2, '.csv'))
+
+
+#Remove any invalid P measurements
+Midwest<-Midwest %>% filter(P_mgkg>0)
+
+#combine Midwest and streambank values
+
+streambank.sel<-streambank_huc8 %>% mutate(dataset="Streambank") |> dplyr::select(name, P_mgkg, Depth_cm, dataset)
+
+Midwest.sel<-Midwest %>% mutate(dataset="Midwest") |> dplyr::select(P_mgkg, Depth_cm, dataset) %>% mutate(name="Midwest")
+
+both<-bind_rows(streambank.sel, Midwest.sel)
+
+#fix order of labels, put Midwest last
+library(forcats)
+
+both$name<-fct_relevel(factor(both$name), "Midwest", after = Inf)
+
+#Plot by HUC8 and depth as well
+
+depth.plot<-ggplot(both)+
+  geom_point(aes(Depth_cm, P_mgkg))+
+  geom_smooth(aes(Depth_cm, P_mgkg), method="lm", se=FALSE)+
+  facet_wrap(~name)
+depth.plot
+
+#Plot by depth only
+depth.plot<-ggplot(both)+
+  geom_point(aes(log10(Depth_cm), log10(P_mgkg)), alpha=0.3)+
+  #geom_smooth(aes(log(Depth_cm), log(P_mgkg)), method="lm")+
+  #scale_shape_manual(values = c(0))+
+  facet_wrap(~dataset)+
+  labs(x="Log depth (cm)",y = bquote("Log TP mgkg"^-1))+
+  #xlab("Log soil depth (cm)")+
+  #ylab("Log TP (mg/kg)")+
+  #ylim(1,3.5)+
+  #labs(color = "Dataset")+
+  theme_bw()+
+  theme(strip.text=element_text(size=14), axis.title = element_text(size = 14),
+        axis.text = element_text(size = 14), legend.title=element_text(size=14), legend.text=element_text(size=14))+
+  scale_y_continuous(breaks = scales::breaks_width(0.5))
+depth.plot
+  
+#write to file
+png(paste0(file.name=dir.figures, "/Fig_streambank_vs_Midwest_TP_DEPTH.png"), width = 2800, height = 1400, res = 300)    
+
+grid.newpage() 
+print(depth.plot) 
+
+dev.off()   
+
+
+
+#Plot across HUC8s
+
+TP.compare<-ggplot(both, aes(factor(name), P_mgkg))+
+  geom_jitter(width = 0.15, height = 0, alpha = 0.1, color = "darkblue") +
+  geom_violin(trim = FALSE, fill = "lightblue", alpha = 0.5, quantiles=0.5, quantile.linetype = "solid")+
+  geom_abline(slope=0, intercept=512.96, linetype="dashed")+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size=14),
+    axis.text.y=element_text(size=14),
+      axis.title=element_text(size=16),
+        panel.grid.major.y=element_line(color="grey90", a),
+        panel.grid.minor=element_line(color="grey95"), 
+        panel.background=element_rect(fill = "transparent", colour = "black"))+
+  labs(x="",y = bquote("Total Phosphorus mgkg"^-1))
+TP.compare
+
+#write to file
+png(paste0(file.name=dir.figures, "/Fig_streambank_vs_Midwest_TP.png"), width = 2900, height = 1800, res = 300)    
+
+grid.newpage() 
+print(TP.compare) 
+
+dev.off()  
+
+```
+
+# Compare geology and soils across streambank and Midwest samples
+
+```{r}
+
+#Subset to same attributes across both datasets
+
+streambank.sub<-streambank |> dplyr::select(any_of(colnames(Midwest))) |> mutate(dataset="Streambank") |> mutate(NLCD_Land=as.factor(NLCD_Land))
+
+names(streambank.sub)
+
+Midwest<-Midwest |> mutate(dataset="Midwest")|> mutate(NLCD_Land=as.factor(NLCD_Land))
+
+all<-bind_rows(streambank.sub, Midwest) 
+
+names(all)
+
+#assign states to locations
+#read in USA state boundaries using tigris package
+states<-states()
+states_sf <- st_as_sf(states) #convert to sf object
+st_bbox(states_sf) #bounding box
+states_sf
+
+st_crs(states_sf) #check reference system
+
+#create spatial object for sample locations:
+all_sf<-st_as_sf(all, coords=c("x", "y"), crs=4269, remove=FALSE)
+
+all_state<-st_join(all_sf, states_sf)
+names(all_state)
+
+
+#select a subset of attributes to compare
+geo.sel<-all_state |> dplyr::select(P_mgkg, dataset, STUSPS, rocknws,pctglactilcrsws, pcthydricws, compstrgthws, caows, p2o5ws, hydricon, hydricrating, drainagecl, taxpartsize, taxceactcl,taxreaction, pctagdrainagews, pctagslphigh2011ws, septicws, wwtpmajordensws, manurews, elevws,sio2ws, na2ows, k2ows, fe2o3ws, p2o5ws, al2o3ws, caows, mgows, hydrlcondws, kffactws, pctglactilloamws, pctglactilcrsws, pcthydricws, pctcrop2011ws, pestic1997ws, precip8110ws, precip9120ws, tmean9120ws, clayws, sandws, omws) |> st_drop_geometry()
+
+
+#attributes without data for streambank samples:
+#caco3_r
+#claytotal_r
+#freeiron_r
+#ksat_r, kffact
+#sandtotal_r 
+#silttotal_r 
+
+#hm, if data is missing for attributes that are used in Midwest model, that might explain poor performance somewhat??
+#make an Midwest model that includes only attributes that are non NA for streambanks?
+
+sapply(geo.sel, class)
+
+class(geo.sel)
+
+
+#Look at numeric attributes first
+
+#need to make nice plot labels, or define them in legend?
+
+#Option to select Subset of states
+#Option to select specific attributes for geology, soils, climate, land use
+
+
+
+
+
+
+geo.sel.long<-geo.sel |> 
+#if want to select states in immediate region:
+#filter(STUSPS %in% c('IL', 'OH', 'IA', 'IN')) |> 
+  dplyr::select(where(is.numeric), dataset) |> 
+  pivot_longer(
+    cols = -c(dataset, P_mgkg),         # Pivot every column EXCEPT your factor column and TP
+    names_to = "variable",     # New column holding the old column names
+    values_to = "value"        # New column holding the numeric values
+  ) |> 
+#select specific attributes
+  dplyr::filter(variable %in% c("clayws", "sandws", "pctglactilloamws", "pcthydricws", "pctcrop2011ws", "pctagdrainagews", "pestic1997ws", "precip9120ws", "tmean9120ws"))
+
+head(geo.sel.long)
+
+#make nice labels for plot
+levels(factor(geo.sel.long$variable))
+
+geo.sel.long$variable<-factor(geo.sel.long$variable, 
+  levels=c("clayws", "sandws", "pctglactilloamws", "pcthydricws", "pctcrop2011ws", "pctagdrainagews", "pestic1997ws", "precip9120ws", "tmean9120ws"),
+  labels=c("% Clay", "% Sand", "% Glacial till - loamy", "% Hydric soils", "% Crop cover, 2011", "% Ag Drainage",  "Pesticide use - 1997", "Average annual precip, 1991-2020", "Average annual temp, 1991-2020"))
+
+compare.plot<-
+ggplot(geo.sel.long, aes(x = dataset, y = value, fill = dataset)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y", labeller = label_wrap_gen(width = 20)) +  # 'free_y' allows each plot to have its own Y-axis range
+  theme(axis.text.x=element_blank(), axis.text.y=element_text(size=16), axis.title=element_text(size=16), legend.text=element_text(size=16), legend.title=element_text(size=16), strip.text=element_text(size=16)) +
+  labs(x = "Sample Type", y = "Value")+
+  scale_fill_manual(values=c("#7570b3","#d95f02"))
+compare.plot
+
+#Write to file 
+png(paste0(file.name=dir.figures, "/Fig_compare_streambank_vs_upland_attributes.png"), width = 3000, height = 2400, res = 300)    
+
+print(compare.plot)
+
+dev.off()  
+
+```
+
+# TP vs key predictors
+
+Load in imputed training data for streambank and Midwest datasets
+
+```{r}
+
+#Read in imputed data, so aren't dealing with NAs
+
+
+model.input1<-"/Margenot_sample_attributes_for_modelling_wSSURGO_LIMITED"
+
+model.input2<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED'
+
+#READ IMPUTED DATA from Model Tuning module: 
+dir.final.model.data<-paste0(dir.output, "/Final_model_comparisons/Final_train_test_datasets")
+
+
+#(note this is training data only)
+
+#Streamabank data, with soil: 
+
+P.Predictors1<-read.csv(paste0(dir.final.model.data, model.input1, "_train_imputed_SOIL_08132026.csv")) |> mutate(dataset="Streambank")
+
+P.Predictors2<-read.csv(paste0(dir.final.model.data, model.input2, "_train_imputed_groupsplit_08252026.csv")) |> mutate(dataset="Midwest")
+
+# Combine datasets into a single master data frame
+P.Predictors <- bind_rows(P.Predictors1, P.Predictors2)
+
+P.Predictors1 |> filter(Depth_cm<30) |> nrow()
+
+```
+
+Calculate R2 and p values for each dataset
+
+```{r}
+
+target_col <- "P_mgkg"
+
+# 1. Pivot numeric predictors long, grouping by dataset and variable
+results_df <- P.Predictors |> 
+  dplyr::select(dataset, all_of(target_col), where(is.numeric)) |> 
+  pivot_longer(
+    cols = -c(dataset, all_of(target_col)), 
+    names_to = "Variable", 
+    values_to = "Predictor_Value"
+  ) |> 
+  drop_na(Predictor_Value, all_of(target_col)) |> 
+  group_by(dataset, Variable) |> 
+  # Fit linear model per dataset and predictor variable
+  summarise(
+    fit = list(lm(as.formula(paste0("`", target_col, "` ~ Predictor_Value")), data = cur_data())),
+    .groups = "drop"
+  ) |> 
+  # Extract R2 and p-value from model summary
+  mutate(
+    sum_fit   = map(fit, summary),
+    R_Squared = map_dbl(sum_fit, ~ round(.x$r.squared, 2)),
+    P_Value   = map_dbl(sum_fit, ~ {
+      co <- .x$coefficients
+      if (nrow(co) >= 2) round(co[2, "Pr(>|t|)"], 4) else NA_real_
+    })
+  ) |> 
+  dplyr::select(dataset, Variable, R_Squared, P_Value)
+
+head(results_df)
+
+View(results_df)
+
+#Write R2 and p values to table
+write_xlsx(results_df, paste0(dir.figures, "/Table_R2_p_values_predictors_vs_TP.xlsx"))
+
+# Check count of significant relationships per dataset
+results_df |> 
+  filter(P_Value < 0.05) |> 
+  count(dataset)
+
+```
+
+TP vs predictors, for variables with highest R2 and significant p value
+
+```{r}
+#For regression, select numeric attributes
+df <- P.Predictors |>  dplyr::select(where(is.numeric))
+target_col <- "P_mgkg"    # Replace with your target column name
+
+# 1. Get the names of all other columns
+other_cols <- setdiff(names(df), target_col)
+
+# 2. Run regression across all columns
+results_list <- lapply(other_cols, function(col) {
+  formula_str <- as.formula(paste0("`", target_col, "` ~ `", col, "`"))
+  
+  fit <- lm(formula_str, data = df)
+  sum_fit <- summary(fit)
+  
+  r2 <- sum_fit$r.squared
+  # Extract the p-value for the predictor variable safely
+  p_val <- if (nrow(sum_fit$coefficients) >= 2) {
+    sum_fit$coefficients[2, "Pr(>|t|)"]
+  } else {
+    NA
+  }
+  
+  data.frame(
+    Variable = col, 
+    R_Squared = round(r2, 2), 
+    P_Value = round(p_val, 4),
+    stringsAsFactors = FALSE
+  )
+})
+
+# 3. Combine into a master summary table
+results_df <- do.call(rbind, results_list)
+
+results_df<-results_df |> mutate(dataset="Midwest")
+
+head(results_df)
+
+#How many significant relationships?
+results_df |> filter(P_Value<0.05) |> nrow()
+
+nrow(results_df)
+
+View(results_df)
+
+# 4. Filter variables with R2 > 0.10 and sort descending by R2
+stronger <- results_df |> 
+  filter(R_Squared >= 0.04) |> 
+  arrange(desc(R_Squared))
+
+stronger
+
+# Make nicer labels for plotting
+# Note: Ensure the replacement vector matches the order of 
+
+levels(factor(stronger$Variable))
+
+#For MIDWEST
+stronger$Label <- factor(
+  stronger$Variable, 
+  labels = c(
+  "Habitat score",
+  "Hydrologic regulation score",
+  "% Crop - cat",
+  "% Crop - ws",
+  "% Coarse eolian sed, cat",
+  "% Coarse eolian sed, ws",
+  "Soil permeability",
+  "Annual precip - 2009, cat",
+  "Annual precip - 2009, ws",
+  "Soil organic carbon, 0-20cm",
+  "Soil organic carbon, 0-30cm",
+  "Soil organic carbon, 5-20cm",
+  "Mean stream temp"))
+  
+  
+#FOR STREAMBANK:
+stronger$Label <- factor(
+  stronger$Variable, 
+  labels = c(
+    "drainagecl",
+    "Anthropogenic N inputs",
+    "NLCD_Land",
+    "NPDES permit density",
+    "N surplus",
+    "% Organic matter",
+    "% Clay - measured",
+    "% Sand - measured",
+    "% Silt - measured",
+    "% Colluvial sediment",
+    "% Herbaceous wetland",
+    "% Hydric soils",
+    "% Open Water",
+    "Mean bedrock depth",
+    "Water input",
+    "WWTP density"
+  )
+)
+
+# 5. Create formatted facet labels using original Variable names as keys
+facet_labels <- setNames(
+  paste0(stronger$Label, " (R² = ", sprintf("%.2f", stronger$R_Squared), ")"),
+  stronger$Variable # Map FROM original column name TO display string
+)
+
+# 6. Pivot selected variables and reorder levels by R2
+streambank.sel <- P.Predictors |> 
+  dplyr::select(all_of(stronger$Variable), P_mgkg) |> 
+  dplyr::select(-any_of(c("soc5_20", "soc0_20", "soc0_30"))) |> 
+  mutate(across(everything(), as.numeric)) |> 
+  pivot_longer(
+    cols = -c(P_mgkg),
+    names_to = "variable",
+    values_to = "value"
+  ) |> 
+  # Fixed typo: stronger$Variable instead of stronger$variable
+  mutate(variable = factor(variable, levels = stronger$Variable))
+
+# 7. Plot ordered facets with R2 in the top header strip
+scatterplot<-ggplot(streambank.sel, aes(x = value, y = P_mgkg)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", linetype = "dashed") +
+  facet_wrap(
+    ~variable, 
+    scales = "free", 
+    labeller = labeller(variable = facet_labels)
+  ) +
+  theme_minimal() +
+  labs(
+    x = "Predictor Value",
+    y = "P_mgkg",
+    title = "Linear Relationships with TP - Midwest samples"
+  )
+scatterplot
+
+
+#Write to file 
+png(paste0(file.name=dir.figures, "/Fig_variables_vs_TP_scatterplots_MIDWEST.png"), width = 3200, height = 2400, res = 300)    
+
+print(scatterplot)
+
+dev.off()  
+```

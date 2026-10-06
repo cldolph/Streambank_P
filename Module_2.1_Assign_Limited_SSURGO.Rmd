@@ -28,7 +28,7 @@ First, specify appropriate attribute file
 file.input<-"/USGS_NCSS_soils_database_attributes_alldepths"
 
 #for Margenot data:
-file.input<-"/Margenot_sample_attributes"
+#file.input<-"/Margenot_sample_attributes"
 
 file.input
 
@@ -60,13 +60,15 @@ ssurgo_dir<-paste0(dir.spatial, "/ssurgo")
 ssurgo_dir  
 
 #ID states in study region 
-states<-as.list(States_sub$STUSPS) 
+states<-c("AR", "IA", "IL", "IN", "KS", "MN", "MO", "ND", "NE", "OH", "SD", "WI")
+#states<-c("IL")
 states  
 
 #Read in soil sample locations, for file of interest  
 #Read in data: 
 P.streamcat<-read.csv(paste0(dir.output, file.input, '_streamcat', '.csv'))  
-nrow(P.streamcat)
+nrow
+names(P.streamcat)
 
 #Assign SampleID if needed
 names(P.streamcat)
@@ -248,8 +250,9 @@ Note that it is possible to have more than one sample at the same location but a
 #hzdept_r = top depth of a horizon 
 
 
-#Note, must use allow.cartersian=TRUE or otherwise get an error, because of the one to many join
-P.ssurgo1<-merge(P.streamcat, Comp2, by=c("MUKEY"), allow.cartesian=TRUE)
+#Note, one to many join
+P.streamcat$MUKEY<-as.factor(P.streamcat$MUKEY)
+P.ssurgo1<-left_join(P.streamcat, Comp2, by=c("MUKEY"))
 
 #filter if Depth of soil sample is between hz levels
 #not applicable for limited SSURGO attributes (ie, if horizon tables have been excluded)
@@ -301,12 +304,12 @@ Merge numeric and categorical SSURGO attributes to all other attributes and writ
 
 ```{r}
 #Merge the two;
-SSURGO.att<-merge(Mukey.mean, Mukey.top_cat, by=c('MUKEY', 'SampleID'))
+SSURGO.att<-left_join(Mukey.mean, Mukey.top_cat, by=c('MUKEY', 'SampleID'))
 head(SSURGO.att)
 #View(SSURGO.att)
 
 #Add in attributes from Valu1 table
-SSURGO.all<-merge(SSURGO.att, valu1, by=c('MUKEY'))
+SSURGO.all<-left_join(SSURGO.att, valu1, by=c('MUKEY'))
 head(SSURGO.all)
 
 #Check that mukeys for sample locations were included
@@ -327,9 +330,10 @@ P.streamcat %>%
 
 ```{r}
 #Merge back to all other attributes previously added for sample locations:
-soilP.att<-merge(P.streamcat, SSURGO.all, by=c("SampleID", "MUKEY"))
+soilP.att<-left_join(P.streamcat, SSURGO.all, by=c("SampleID", "MUKEY"))
 #View(soilP.att)
 nrow(soilP.att)
+names(soilP.att)
 
 #write to table;
 #these are unique attributes for each map unit, from multiple SSURGO tables

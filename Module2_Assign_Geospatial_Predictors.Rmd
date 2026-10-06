@@ -15,15 +15,15 @@ This script builds on Module 1 and generates geospatial attributes associated wi
 
 Attributes are from the following sources:
 
--   the NHDPlusv2 stream network (NHD)
+- the NHDPlusv2 stream network (NHD)
 
--   the National Wetlands Inventory (NWI),
+- the National Wetlands Inventory (NWI),
 
--   National Land Cover Dataset (NLCD)
+- National Land Cover Dataset (NLCD)
 
--   gSSURGO soils data
+- gSSURGO soils data
 
--   EPA StreamCat
+- EPA StreamCat
 
 This approach is updated and adapted from the scripts available at: <https://github.com/cldolph/SoilP>
 
@@ -41,7 +41,7 @@ For appending to names of saved files below (this is only needed for streambank 
 
 ```{r}
 #For streambank samples:
-#dataset<-'/Margenot_'
+dataset<-'/Margenot_'
 
 #For historic samples: 
 #dataset<-'/Margenot_PEDON'
@@ -540,17 +540,19 @@ Load sample points with all attributes attached so far:
 #set P sample file input name:
 
 #For streambank and historic P samples
-#file.input<-paste0(dataset, "sample_attributes")
-#file.input
+file.input<-paste0(dataset, "sample_attributes")
+file.input
 
 #For soil P database:
-file.input<-"/USGS_NCSS_soils_database_attributes_alldepths"
+#file.input<-"/USGS_NCSS_soils_database_attributes_alldepths"
+
 
 #Read in data:
-P.att<-read.csv(paste0(dir.output, file.input, '.csv'))
+P.att<-fread(paste0(dir.output, file.input, '.csv'))
 nrow(P.att)
 head(P.att)
 names(P.att)
+
 
 #number of unique comids
 P.att %>% 
@@ -584,7 +586,8 @@ All.Streamcat
 
 #Get all variable descriptions!!
 Definitions<-sc_get_params(param='variable_info')
-View(Definitions)
+#View(Definitions)
+
 
 #Subset the Streamcat attributes you want to use
 #eliminate fire related, containing "burn", "sev", "fire", "procmask"
@@ -601,26 +604,57 @@ Streamcat.select<- All.Streamcat %>%
   
 Streamcat.select
 
+
+
+#Write select StreamCat definitions to file
+
+head(Streamcat.select)
+library(writexl)
+
+names(Definitions)
+
+#first remove [AOI] text for matching
+Definitions$metric <- gsub("[AOI]", "", Definitions$metric, fixed = TRUE)
+
+Def.sel2<-inner_join(Definitions, Streamcat.select, by=c("metric"="All.Streamcat"))
+
+nrow(Definitions)
+nrow(Def.sel2)
+
+write_xlsx(Definitions, paste0(dir.output, "/StreamCat_Definitions_Oct_2026.xlsx"))
+
+
+
 #Create list of select attributes in appropriate format for sc_get_data()
 metric.list=paste0(Streamcat.select$All.Streamcat, collapse=",")
 metric.list
 
 
-#now get list of COMIDs for sample sites
+#Pull StreamCat attributes: 
 
+#------------------------------------------------
+#Option 1: For small datasets (i.e., Streambank) - 
+#------------------------------------------------
 #Original approach (this works fine for smallish datasets)
 comid.list=paste0(unique(P.att$comid), collapse=",")
 comid.list
 #Get streamcat attributes for this list of comids:
 sc_data<-sc_get_data(metric=metric.list, aoi='cat,ws', comid=comid.list) #only a few seconds!
 
+#Get riparian attributes:
+sc_data_rp<-sc_get_data(metric=metric.list, aoi='catrp100,wsrp100', comid=comid.list)
 
+#If dataset is small, skip to next chunk
+
+#--------------------------------------------------
+#Option 2: For larger datasets
+#--------------------------------------------------
 #For large data, a very large data request to sc_get_data appears to crash it out; 
 #So split data into equal chunks and apply function, then combine (split, apply, combine)
 #filter to set of unique comids associated with sample data
 
 # Define chunk size
-chunk_size <- round(length(unique(P.att$comid))/5)  # adjust if needed
+chunk_size <- round(length(unique(P.att$comid))/50)  # adjust if needed
 chunk_size
 
 # Split COMIDs into chunks
@@ -631,15 +665,125 @@ comid_chunks
 # Iterate over chunks, call sc_get_data, and combine results
 #(takes a few minutes)
 
+#(You may need to break this up into non riparian and riparian attributes...)
+
 sc_data_list <- lapply(comid_chunks, function(chunk) {
   comid.list <- paste0(chunk, collapse = ",")
-  sc_get_data(metric = metric.list, aoi = "cat,ws", comid = comid.list, showAreaSqKm=TRUE)
+  sc_get_data(metric = metric.list, aoi = "cat,ws", comid = comid.list, showAreaSqKm=FALSE)
+})
+
+# Combine all results into one dataframe 
+sc_data <- do.call(rbind, sc_data_list)  
+
+
+#Repeat for riparian attributes
+sc_data_list_rp <- lapply(comid_chunks, function(chunk) {
+  comid.list <- paste0(chunk, collapse = ",")
+  sc_get_data(metric = metric.list, aoi = "catrp100,wsrp100", comid = comid.list, showAreaSqKm=FALSE)
 })
 
 
 # Combine all results into one dataframe
-sc_data <- do.call(rbind, sc_data_list)
+sc_data_rp <- do.call(rbind, sc_data_list_rp)
 
+#-----------------------------------------------
+#Option 3 - if StreamCat Tools are really crashing out (bad gateway, etc), download attributes by state (Note: this takes quite a long time, > 2 hours if you have 12 states like for North-Central US dataset)
+#-----------------------------------------------
+All.Streamcat <- as.data.frame(All.Streamcat)
+
+Streamcat.select <- All.Streamcat %>% 
+  filter(!grepl('burn|sev|fire|procmask|vegresp|frstloss', All.Streamcat)) %>% 
+  filter(!grepl('2001|2004|2006|2008|2013|2016|2019', All.Streamcat)) %>% 
+  filter(!grepl('_19|_20', All.Streamcat))
+
+metrics_vec <- Streamcat.select$All.Streamcat
+
+# Collapse metrics into a single comma-separated string
+metrics_string <- paste(metrics_vec, collapse = ",")
+
+# 2. Extract unique COMIDs & state list
+target_comids <- unique(na.omit(P.att$comid))
+states_vec <- c("AR", "IA", "IL", "IN", "KS", "MN", "MO", "ND", "NE", "OH", "SD", "WI")
+
+# 3. Loop over states (Cat & WS Scale)
+
+start.time<-Sys.time()
+start.time
+
+sc_cat_ws_list <- lapply(states_vec, function(st) {
+  message("Fetching cat/ws data for state: ", st)
+  
+  tryCatch({
+    # Query state with specified metrics
+    st_data <- sc_get_data(
+      metric = metrics_string,
+      aoi = "cat,ws",
+      state = st,
+      showAreaSqKm = FALSE
+    )
+    
+    # Subset immediately to target COMIDs
+    st_sub <- st_data %>% filter(comid %in% target_comids)
+    return(st_sub)
+  }, error = function(e) {
+    message("Failed state ", st, ": ", e$message)
+    return(NULL)
+  })
+})
+
+# Bind all state rows together
+sc_data <- bind_rows(sc_cat_ws_list)
+
+
+# 4. Loop over states (Riparian Scale)
+sc_rp_list <- lapply(states_vec, function(st) {
+  message("Fetching riparian data for state: ", st)
+  
+  tryCatch({
+    st_data_rp <- sc_get_data(
+      metric = metrics_string,
+      aoi = "catrp100,wsrp100",
+      state = st,
+      showAreaSqKm = FALSE
+    )
+    
+    st_sub_rp <- st_data_rp %>% filter(comid %in% target_comids)
+    return(st_sub_rp)
+  }, error = function(e) {
+    message("Failed riparian state ", st, ": ", e$message)
+    return(NULL)
+  })
+})
+
+end.time<-Sys.time()
+end.time-start.time
+
+sc_data_rp <- bind_rows(sc_rp_list)
+
+```
+
+Merge StreamCat attributes by COMID to sampling location:
+
+```{r}
+
+P.streamcat1<-left_join(P.att, sc_data, by=c("comid"))
+
+P.streamcat<-left_join(P.streamcat1, sc_data_rp, by="comid")
+nrow(P.streamcat)
+
+View(P.streamcat)
+
+#write to file:
+#check file input first:
+file.input
+
+write.csv(P.streamcat, paste0(dir.output, file.input %>% gsub(".csv", "", .), "_streamcat.csv"))
+
+```
+
+Calculate average catchment and watershed area
+
+```{r}
 # Preview
 head(sc_data)
 names(sc_data)
@@ -648,25 +792,6 @@ nrow(sc_data) #Note that some values were dropped - these may be sink catchments
 
 #Average catchment area for study region:
 sc_data %>% dplyr::select(catareasqkm, wsareasqkm) %>% summarise(mean.catchment.area=mean(catareasqkm), median.catchment.area=median(catareasqkm), mean.ws.area=mean(wsareasqkm), median.ws.area=median(wsareasqkm))
-
-
-
-```
-
-Merge StreamCat attributes by COMID to sampling location:
-
-```{r}
-
-P.streamcat<-merge(P.att, sc_data, by=c("comid"))
-nrow(P.streamcat)
-#View(P.streamcat)
-
-#write to file:
-#check file input first:
-file.input
-
-write.csv(P.streamcat, paste0(dir.output, file.input %>% gsub(".csv", "", .), "_streamcat.csv"))
-
 ```
 
 ## 6.2 Get SSURGO attributes by MUKEY
@@ -697,8 +822,11 @@ ssurgo_dir<-paste0(dir.spatial, "/ssurgo")
 ssurgo_dir
 
 #ID states in study region
-states<-as.list(States_sub$STUSPS)
-states
+#states<-c("AR", "IA", "IL", "IN", "KS", "MN", "MO", "ND", "NE", "OH", "SD", "WI")
+#states
+
+#or assign if streambank samples
+states<-"IL"
 
 #Read in soil sample locations, for file of interest
 
@@ -706,6 +834,7 @@ states
 P.streamcat<-read.csv(paste0(dir.output, file.input, '_streamcat', '.csv'))
 
 nrow(P.streamcat)
+names(P.streamcat)
 
 #Create SampleID if it doesn't exist
 
@@ -806,17 +935,17 @@ Component.sub<-Component %>%
 
 Chorizon does not have unique cokey. The multiple subcomponents within each component (cokey) for Chorizon are multiple soil horizons (at different depths).
 
--   hzdept_r - top depth of soil horizon
+- hzdept_r - top depth of soil horizon
 
--   hzdepb-r - bottom depth of soil horizon
+- hzdepb-r - bottom depth of soil horizon
 
--   Note: SSURGO table metadata reports depth units as cm
+- Note: SSURGO table metadata reports depth units as cm
 
 Note: Originally, I sought to assign 1 horizon layer to each cokey, by doing the following:
 
--   eliminate samples from the very shallow surface that are likely to be plant material? nrow(Chorizon.surface) Chorizon.soil\<-Chorizon.surface %\>% filter(hzdepb_r\>3
+- eliminate samples from the very shallow surface that are likely to be plant material? nrow(Chorizon.surface) Chorizon.soil\<-Chorizon.surface %\>% filter(hzdepb_r\>3
 
--   choose uppermost surface layer, to avoid component attributes that include plant material at the surface rather than soil
+- choose uppermost surface layer, to avoid component attributes that include plant material at the surface rather than soil
 
 However, in the module below, I retain all horizon depths for each cokey and then later, select the horizon depth in each cokey that most closely matches the depth of the actual soil sample
 
@@ -935,19 +1064,19 @@ nrow(Chorizon)
 
 Notes:
 
--   chkey - primary key in horizon table - unique identifier for each soil horizon
+- chkey - primary key in horizon table - unique identifier for each soil horizon
 
--   chtexture - contains info on soil texture (silt, clay, sand etc) for a given soil horizon
+- chtexture - contains info on soil texture (silt, clay, sand etc) for a given soil horizon
 
-    -   there are different textures per horizon; for the different subcomponents - see <https://sdmdataaccess.nrcs.usda.gov/documents/ReturningSoilTextureRelatedAttributes.pdf>
+  - there are different textures per horizon; for the different subcomponents - see <https://sdmdataaccess.nrcs.usda.gov/documents/ReturningSoilTextureRelatedAttributes.pdf>
 
--   chtkey - links soil texture (in chtexture) to soil horizon
+- chtkey - links soil texture (in chtexture) to soil horizon
 
--   chtexturegrp - contains complex texture group names
+- chtexturegrp - contains complex texture group names
 
--   'rvindicator' column in chtexturegrp - from Table Column Descriptions: 'A yes/no field that indicates if a value is representative for the component'
+- 'rvindicator' column in chtexturegrp - from Table Column Descriptions: 'A yes/no field that indicates if a value is representative for the component'
 
--   Select rvindicator = Yes - leaves you with unique value, this is the 'representative' component
+- Select rvindicator = Yes - leaves you with unique value, this is the 'representative' component
 
 ```{r}
 #Create Chtexture Table (texture/grain size)
@@ -1344,25 +1473,29 @@ write.table(soilP.att, paste0(dir.output, file.input,'_SSURGO_attributes_mapunit
 
 Sample datasets have had the following pre-processing:
 
--   NHD stream type from NHDv2Plus
+- NHD stream type from NHDv2Plus
 
--   NWI wetland type, if within wetland polygon
+- NWI wetland type, if within wetland polygon
 
--   NLCD 2019 Land Use category in 30m cell where sample occurs
+- NLCD 2019 Land Use category in 30m cell where sample occurs
 
--   EPA StreamCat attributes
+- EPA StreamCat attributes
 
--   gSSURGO attributes
+- gSSURGO attributes
 
 Additional processing below:
 
--   remove extraneous attributes (not likely applicable to study area)
+- remove extraneous attributes (not likely applicable to study area)
 
--   remove attributes with no information (all 0 or all NA)
+- remove attributes with no information (all 0 or all NA)
 
 ## 7.1 Remove meta data attributes
 
 ```{r}
+
+#Read in data processed so far:
+
+soilP.att<-fread(paste0(dir.output, file.input,'_SSURGO_attributes_mapunit_LIMITED.csv'))
 
 names(soilP.att)
 
@@ -1370,8 +1503,7 @@ names(soilP.att)
 
 soilP.less<-
 soilP.att %>% 
-  dplyr::select(-contains(c('State', 'SampleID', 'MUKEY', 'comid', 'MUSYM', 'ACRES', 'ID', 'dataset', 'Site', 'replicates', 'field_1', 'comppct_r.x', 'comppct_r.y', 'musumcpct', 'musumcpcta', 'musumcpcts'))) %>% 
-  dplyr::select(-starts_with("X", ignore.case = FALSE))
+  dplyr::select(-(c('State', 'MUKEY','SampleID', 'dataset', 'musumcpct', 'musumcpcta', 'musumcpcts')))
 
 ncol(soilP.att)
 ncol(soilP.less)
@@ -1423,6 +1555,10 @@ P.data<- P.data %>%
 Note: this needs to be updated for columns actually used in model
 
 ```{r}
+
+#if original model, just set dataset to current dataset
+soilP.data<-P.data
+
 #Load data used to build model of interest:
 
 model<-'/USGS_NCSS_soils_database_attributes_alldepths_for_modelling_wSSURGO_LIMITED'

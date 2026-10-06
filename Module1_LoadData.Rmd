@@ -6,7 +6,7 @@ output: html_document
 highlight: kate
     pandoc_args: ["--lua-filter=number-lines.lua"] # Optional: for continuous line numbering across chunks
 editor_options: 
-  chunk_output_type: inline
+  chunk_output_type: console
 ---
 
 # 1 Overview
@@ -28,7 +28,7 @@ rm(list=ls())
 #install and load packages
 
 #list of necessary packages 
-want <- c('data.table', 'tidyverse', 'readxl', 'writexl', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools', 'pbapply', 'digest', 'grid')
+want <- c('data.table', 'tidyverse', 'readxl', 'writexl', 'data.table', 'mapview', 'sf', 'terra', 'tmap','geodata', 'RSelenium', 'rvest', 'httr', 'dataRetrieval', 'DT', 'FedData', 'raster', 'nhdplusTools', 'tigris', 'janitor', 'segmented', 'mcp','grDevices', 'sp', 'Hmisc','tools', 'randomForest', 'plyr', 'devtools', 'pbapply', 'digest', 'grid')
 
 
 need <- want[!(want %in% installed.packages()[,"Package"])]
@@ -57,7 +57,7 @@ library(StreamCatTools)
 dir.root<-getwd()
 
 #Input data
-dir.data<-paste(dir.root, "/Streambank_P_measured_data", sep="")
+dir.data<-paste(dir.root, "/TP_data", sep="")
 
 #Spatial data
 dir.spatial<-paste(dir.root, "/Spatial_data", sep="")
@@ -117,6 +117,7 @@ IL_streambank_samples.clean %>% dplyr::select(y,x) %>% distinct() %>% count() %>
 #358 streambank P locations 
 
 #Average streambank TP
+summary(IL_streambank_samples.clean$P_mgkg)
 
 ```
 
@@ -256,9 +257,9 @@ Note 3: I have converted feature ID to COMID, but note some differences: Feature
 
 In the National Hydrography Dataset (NHD) and NHDPlus, both **FeatureID** and **COMID** serve as identifiers, but they are used for different features:. 
 
--   **COMID (Component ID):** This is a unique identifier primarily associated with the **NHDFlowline** features in the NHDPlusV2 data. An NHDFlowline represents a segment of a river, stream, or other linear water feature. Essentially, every stream segment has a unique COMID. The COMID can also be used as an identifier for the catchment polygon and value-added attributes that describe characteristics of the catchment's interior.
+- **COMID (Component ID):** This is a unique identifier primarily associated with the **NHDFlowline** features in the NHDPlusV2 data. An NHDFlowline represents a segment of a river, stream, or other linear water feature. Essentially, every stream segment has a unique COMID. The COMID can also be used as an identifier for the catchment polygon and value-added attributes that describe characteristics of the catchment's interior.
 
--   **FeatureID:** This identifier is used for the **catchment** features in the NHDPlusV2 dataset, which are polygons representing the drainage area contributing to a specific flowline. A positive FeatureID always matches the COMID of the associated flowline, indicating the catchment drains into that particular flowline. A negative FeatureID, on the other hand, indicates a sink, a catchment without an associated flowline, implying it's an internal drainage basin or a closed lake
+- **FeatureID:** This identifier is used for the **catchment** features in the NHDPlusV2 dataset, which are polygons representing the drainage area contributing to a specific flowline. A positive FeatureID always matches the COMID of the associated flowline, indicating the catchment drains into that particular flowline. A negative FeatureID, on the other hand, indicates a sink, a catchment without an associated flowline, implying it's an internal drainage basin or a closed lake
 
 Data processing based on module 4 in <https://github.com/cldolph/SoilP/tree/main/Soil_P_input>
 
@@ -313,7 +314,7 @@ modern.soil<-soilP_database %>%
 head(modern.soil)   
 
 #Write compiled modern upland soil data to file
-write.csv(modern.soil, paste0(dir.output, "/USGS_NCSS_soils_database_attributes_alldepths"), row.names=FALSE)
+#write.csv(modern.soil, paste0(dir.output, "/USGS_NCSS_soils_database_attributes_alldepths"), row.names=FALSE)
 ```
 
 # 4 Map of sample locations
@@ -395,7 +396,12 @@ names(big.soil)
 big.soil<-big.soil %>% dplyr::filter(x<0)
 
 
-big_soil_sf<-st_as_sf(big.soil %>% filter(!is.na(x)), coords=c("x", "y"), crs=4269)  
+#option: exclude historical samples
+levels(factor(big.soil$dataset))
+data_subset<-big.soil |> filter (dataset %in% c("Margenot_streambank", "USGS_USDA")) |> droplevels() 
+
+
+big_soil_sf<-st_as_sf(data_subset %>% filter(!is.na(x)), coords=c("x", "y"), crs=4269)  
 
 
 #Create nicer labels for datasets 
@@ -403,12 +409,18 @@ big_soil_sf<-st_as_sf(big.soil %>% filter(!is.na(x)), coords=c("x", "y"), crs=42
 
 levels(factor(big_soil_sf$dataset))
 
-big_soil_sf<-big_soil_sf %>% 
-  mutate(dataset_label=ifelse(dataset=="pre-1950"|dataset=="pre-1950", "Margenot_pedon", dataset))
+#big_soil_sf<-big_soil_sf %>% 
+#  mutate(dataset_label=ifelse(dataset=="pre-1950"|dataset#=="pre-1950", "Margenot_pedon", dataset))
 
-levels(factor(big_soil_sf$dataset_label))
-
-big_soil_sf$dataset_label=factor(big_soil_sf$dataset_label, levels=c("Margenot_pedon", "Margenot_streambank", "USGS_USDA"), labels=c("Historic IL soil pedons", "IL streambank samples", "Modern USGS/USDA soil pedons"))  
+big_soil_sf$dataset_label=factor(big_soil_sf$dataset, 
+  levels=c(
+    #"Margenot_pedon", 
+    "Margenot_streambank", 
+    "USGS_USDA"), 
+  labels=c(
+    #"Historic IL soil pedons", 
+    "Streambank samples", 
+    "Midwest samples"))  
 
 #Create bigger bounding box for legend
 
@@ -445,15 +457,23 @@ inset_map
 
 #Main Map:  
 
+#Check basemap options:
+#Note that some options now require API key
+tmap_providers()
+
 tmap_mode("plot")  
 
 Site.map <- 
+  tm_basemap("Esri.WorldImagery")+
   tm_shape(big_soil_sf, bbox = bbox_new) +   
-  tm_symbols(fill = "dataset_label", size = 0.5, fill.scale = tm_scale(values = c("#1b9e77", "#d95f02", "#7570b3")), fill.legend = tm_legend(title = "")   ) +   
-tm_shape(states_subset)+   
-    tm_borders()+   
-tm_basemap(server = "CartoDB.PositronNoLabels")+   
-tm_compass(type = "arrow", position = c("right", "bottom")) +   
+  tm_symbols(fill = "dataset_label", size = 0.4, fill.scale = tm_scale(values = c("#d95f02", "#7570b3")), fill.legend = tm_legend(title = "")   ) +   
+tm_shape(states)+
+  tm_borders(col = "#d3d3d3", lwd = 1) + 
+#tm_shape(states_subset)+   
+#    tm_borders()+   
+#CARTO basemaps now require API Key, but so far this isn't working:
+#tm_basemap("CartoDB.PositronNoLabels", api="cb1_3sj5_1_141a2f2eec7a1c3e4c3681fe")+  
+  tm_compass(type = "arrow", position = c("right", "bottom")) +   
 tm_layout(     legend.position = c(0.45, 1.0),     title.position = c('right', 'top'),     legend.text.size = 1.4)
 Site.map  
 
@@ -471,7 +491,7 @@ print(inset_map, vp = vp_inset)
 
 #save map to file
 
-png(paste0(file.name=dir.figures, "/Fig1_soilP_ALL_locations_map.png"), width = 3000, height = 2400, res = 300)    
+png(paste0(file.name=dir.figures, "/Fig1_soilP_locations_map_REVISED.png"), width = 3000, height = 2400, res = 300)    
 
 grid.newpage() 
 print(Site.map) 
@@ -586,6 +606,10 @@ names(big.soil)
 
 levels(factor(big.soil$dataset))
 
+#modern upland data
+big.soil |> filter(P_mgkg>0) |> group_by(dataset) |> dplyr::summarize(mean=mean(P_mgkg), median=median(P_mgkg), min=min(P_mgkg), max=max(P_mgkg))
+
+
 #Mean TP by dataset and depth category
 #For modern soil, restrict to OH, IL, IA, IN?
 
@@ -638,6 +662,24 @@ levels(factor(big.soil$dataset))
 ## 5.4 Manuscript figure: Plot P by depth category across datasets
 
 ```{r}
+names(big_soil_sf)
+
+depth.plot<-ggplot(big_soil_sf |> st_drop_geometry())+
+  geom_point(aes(Depth_cm, P_mgkg))+
+  #geom_smooth(aes(Depth_cm, P_mgkg), method="lm", se=FALSE)+
+  facet_wrap(~dataset_label, ncol=2)+
+  #scale_color_manual(values= c("#d95f02", "#7570b3"))+
+  theme_bw()+
+  labs(x="Depth (cm)",y = bquote("Total Phosphorus mgkg"^-1))
+depth.plot
+
+#write to file
+png(paste0(file.name=dir.figures, "/Fig_streambank_vs_upland_TP_DEPTH.png"), width = 2800, height = 1400, res = 300)    
+
+grid.newpage() 
+print(depth.plot) 
+
+dev.off()  
 
 
 #Make nice labels for datasets
